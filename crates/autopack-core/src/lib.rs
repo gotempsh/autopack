@@ -37,6 +37,7 @@ pub mod generate;
 pub mod lock;
 pub mod mise;
 pub mod plan;
+pub mod procfile;
 pub mod provider;
 
 pub use app::App;
@@ -48,6 +49,7 @@ pub use generate::{BuildContext, APP_DIR};
 pub use lock::Lock;
 pub use mise::{MisePackages, PackageRequest};
 pub use plan::BuildPlan;
+pub use procfile::Procfile;
 pub use provider::{Provider, ProviderRegistry};
 
 use indexmap::IndexMap;
@@ -95,6 +97,15 @@ pub fn analyze(app: &App, env: &Environment, registry: &ProviderRegistry) -> Res
         ctx.set_lock(lock);
     }
     ctx.add_metadata("provider", provider.id());
+
+    // Every non-`web` Procfile process becomes a task. Doing it here rather
+    // than in each provider means all of them get it, and a Procfile means the
+    // same thing whatever language the app is written in.
+    if let Some(procfile) = Procfile::load(app)? {
+        for (name, command) in procfile.tasks() {
+            ctx.add_task(name, command);
+        }
+    }
     if let Some(file) = loaded.source.file() {
         ctx.add_metadata(
             "config",

@@ -35,6 +35,16 @@ pub struct Deploy {
     /// User the container runs as. `None` means root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<RuntimeUser>,
+
+    /// Named one-off commands the platform runs against this image, keyed by
+    /// process name — `release` before a deploy goes live, `worker` alongside
+    /// it.
+    ///
+    /// They share the image, so nothing extra is built for them. Keeping them
+    /// out of the start command is what stops a migration running once per
+    /// replica per restart.
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    pub tasks: IndexMap<String, String>,
 }
 
 /// An unprivileged user created in the runtime image.
@@ -62,6 +72,17 @@ impl Deploy {
     pub fn add_variable(&mut self, key: impl Into<String>, value: impl Into<String>) -> &mut Self {
         self.variables.insert(key.into(), value.into());
         self
+    }
+
+    /// Register a task the platform can run against the image.
+    pub fn add_task(&mut self, name: impl Into<String>, command: impl Into<String>) -> &mut Self {
+        self.tasks.insert(name.into(), command.into());
+        self
+    }
+
+    /// The conventional pre-deploy task, if one was declared.
+    pub fn release_task(&self) -> Option<&str> {
+        self.tasks.get(crate::procfile::RELEASE).map(String::as_str)
     }
 
     /// Prepend a directory to the runtime `PATH`, ignoring duplicates.

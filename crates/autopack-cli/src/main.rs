@@ -358,6 +358,20 @@ fn print_info(analysis: &Analysis) {
     if let Some(start) = &analysis.plan.deploy.start_command {
         println!("Start command: {start}");
     }
+
+    if !analysis.plan.deploy.tasks.is_empty() {
+        println!("Tasks:");
+        for (name, command) in &analysis.plan.deploy.tasks {
+            // `release` has a meaning a platform acts on; the rest are just
+            // named processes it can run.
+            let note = if name == autopack_core::procfile::RELEASE {
+                "  (run before the deploy goes live)"
+            } else {
+                ""
+            };
+            println!("  {name:<10} $ {command}{note}");
+        }
+    }
 }
 
 fn emit(output: Option<&Path>, contents: &str) -> Result<()> {

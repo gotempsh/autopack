@@ -346,6 +346,71 @@ Secrets are passed by name (`autopack build . --secret DATABASE_URL`), read from
 the environment at build time, mounted with `--mount=type=secret`, and never
 written into the plan or into an image layer.
 
+## Tasks
+
+A `Procfile` declares named processes. `web` becomes the container's start
+command; **every other process becomes a task** the platform can run against
+the same image:
+
+```procfile
+web:     gunicorn app:app --bind 0.0.0.0:${PORT:-8000}
+release: python manage.py migrate
+worker:  celery -A app worker
+```
+
+```
+$ autopack info .
+Start command: gunicorn app:app --bind 0.0.0.0:${PORT:-8000}
+Tasks:
+  release    $ python manage.py migrate  (run before the deploy goes live)
+  worker     $ celery -A app worker
+```
+
+They land in the plan, so a platform can read them without re-parsing anything:
+
+```json
+"deploy": {
+  "startCommand": "gunicorn app:app --bind 0.0.0.0:${PORT:-8000}",
+  "tasks": { "release": "python manage.py migrate", "worker": "celery -A app worker" }
+}
+```
+
+Nothing extra is built. A task runs against the image that was already
+produced:
+
+```bash
+docker run --rm --entrypoint /bin/sh myapp:latest -c "python manage.py migrate"
+```
+
+`release` is the one name with an agreed meaning — run it once, before the new
+version takes traffic. Everything else is just a named process.
+
+### Why this is not cosmetic
+
+Without somewhere to put a migration, it ends up in the start command:
+
+```procfile
+web: python manage.py migrate && gunicorn app.wsgi     # don't
+```
+
+That runs the migration in **every replica on every restart**, racing them
+against each other. It is a common shape — `temps-examples/examples/starters/python/django`
+carries exactly this in its `nixpacks.toml` — and it only looks fine until the
+first time you scale past one replica.
+
+Tasks can also be declared directly, for an app with no Procfile:
+
+```json
+{ "deploy": { "tasks": { "release": "npx prisma migrate deploy" } } }
+```
+
+or with `AUTOPACK_RELEASE_CMD`.
+
+**autopack does not invent tasks.** A Rails app with a `db/migrate` directory
+gets no migration task unless one is declared. Running migrations is a
+destructive, ordering-sensitive operation, and inferring it from the presence
+of a directory is exactly the kind of guess that should never be made silently.
+
 ## Compatibility with nixpacks and railpack
 
 An app already deployed with another builder carries a config file describing

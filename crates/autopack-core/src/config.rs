@@ -119,6 +119,10 @@ pub struct DeployPatch {
     /// Appended to the runtime `PATH`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub paths: Vec<String>,
+
+    /// Merged into the tasks the platform can run, keyed by process name.
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    pub tasks: IndexMap<String, String>,
 }
 
 impl Config {
@@ -193,6 +197,13 @@ impl Config {
                 self.steps.entry(step.to_string()).or_default().commands =
                     Some(vec![Command::shell(cmd)]);
             }
+        }
+
+        if let Some(cmd) = env.config("RELEASE_CMD") {
+            self.deploy
+                .get_or_insert_with(DeployPatch::default)
+                .tasks
+                .insert(crate::procfile::RELEASE.to_string(), cmd.to_string());
         }
 
         if let Some(cmd) = env.config("START_CMD") {
@@ -281,6 +292,9 @@ impl DeployPatch {
         }
         for path in &self.paths {
             plan.deploy.add_path(path.clone());
+        }
+        for (name, command) in &self.tasks {
+            plan.deploy.add_task(name.clone(), command.clone());
         }
     }
 }

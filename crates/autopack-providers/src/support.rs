@@ -1,7 +1,7 @@
 //! Helpers shared by providers.
 
 use autopack_core::plan::Layer;
-use autopack_core::{App, Result};
+use autopack_core::{App, Procfile, Result};
 
 /// Image the static file server binary is copied from.
 ///
@@ -57,29 +57,11 @@ pub fn caddyfile(root: &str, spa: bool) -> String {
 
 /// The `web:` process from a Procfile, if there is one.
 ///
-/// Procfiles are the closest thing to a cross-language declaration of "how do I
-/// start", so every provider checks for one before guessing.
+/// Procfiles are the closest thing to a cross-language declaration of "how do
+/// I start", so every provider checks for one before guessing. The non-`web`
+/// processes become tasks, registered centrally by `analyze`.
 pub fn procfile_web_command(app: &App) -> Result<Option<String>> {
-    let Some(contents) = app.read_file_opt("Procfile")? else {
-        return Ok(None);
-    };
-
-    for line in contents.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if let Some((name, command)) = line.split_once(':') {
-            if name.trim().eq_ignore_ascii_case("web") {
-                let command = command.trim();
-                if !command.is_empty() {
-                    return Ok(Some(command.to_string()));
-                }
-            }
-        }
-    }
-
-    Ok(None)
+    Ok(Procfile::load(app)?.and_then(|p| p.web().map(str::to_string)))
 }
 
 /// Manifest files that unambiguously identify an ecosystem.

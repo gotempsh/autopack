@@ -87,6 +87,7 @@ pub struct BuildContext<'a> {
     runtime_commands: Vec<Command>,
     deploy_variables: IndexMap<String, String>,
     deploy_paths: Vec<String>,
+    tasks: IndexMap<String, String>,
 }
 
 impl<'a> BuildContext<'a> {
@@ -119,6 +120,7 @@ impl<'a> BuildContext<'a> {
             runtime_commands: Vec::new(),
             deploy_variables: IndexMap::new(),
             deploy_paths: Vec::new(),
+            tasks: IndexMap::new(),
         }
     }
 
@@ -290,6 +292,11 @@ impl<'a> BuildContext<'a> {
         }
     }
 
+    /// Register a task the platform can run against the built image.
+    pub fn add_task(&mut self, name: impl Into<String>, command: impl Into<String>) {
+        self.tasks.insert(name.into(), command.into());
+    }
+
     /// Record a fact for `autopack info`.
     pub fn add_metadata(&mut self, key: impl Into<String>, value: impl Into<String>) {
         self.metadata.insert(key.into(), value.into());
@@ -365,6 +372,7 @@ impl<'a> BuildContext<'a> {
         };
         plan.deploy.start_command = self.start_command.clone();
         plan.deploy.user = self.runtime_user.clone();
+        plan.deploy.tasks = self.tasks.clone();
         plan.deploy.variables = self.deploy_variables.clone();
         plan.deploy.paths = self.deploy_paths.clone();
         if runtime_has_packages {

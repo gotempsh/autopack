@@ -137,6 +137,9 @@ impl RailpackConfig {
                 start_command: deploy.start_command.clone(),
                 variables: deploy.variables.clone(),
                 paths: deploy.paths.clone(),
+                // Neither Railpack nor Nixpacks has a task concept; tasks come
+                // from a Procfile or autopack.json.
+                tasks: IndexMap::new(),
             });
         }
 
