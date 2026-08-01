@@ -78,7 +78,10 @@ fn build_plan_for(path: &PathBuf) -> Result<(), Error> {
         println!("  {key:<16} {value}");
     }
     for (tool, request) in &analysis.packages {
-        println!("  runtime {tool:<8} {} (from {})", request.version, request.source);
+        println!(
+            "  runtime {tool:<8} {} (from {})",
+            request.version, request.source
+        );
     }
 
     // 5. Do something with the plan.
@@ -101,7 +104,11 @@ fn build_plan_for(path: &PathBuf) -> Result<(), Error> {
     //    `analyze` already applied it — exact runtime versions and
     //    digest-pinned base images. This is just to show it was picked up.
     match Lock::load(app.source())? {
-        Some(lock) => println!("\nlocked: {} tools, {} images", lock.tools.len(), lock.images.len()),
+        Some(lock) => println!(
+            "\nlocked: {} tools, {} images",
+            lock.tools.len(),
+            lock.images.len()
+        ),
         None => println!("\nno autopack.lock — versions resolve at build time"),
     }
 

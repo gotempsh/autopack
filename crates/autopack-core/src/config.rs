@@ -125,16 +125,43 @@ impl Config {
     /// Load configuration for `app`, layering `AUTOPACK_*` variables on top of
     /// the config file. Environment variables win on conflict.
     pub fn load(app: &App, env: &Environment) -> Result<Self> {
-        let file_name = env.config("CONFIG_FILE").unwrap_or(DEFAULT_CONFIG_FILE);
-        let mut config = match app.read_file_opt(file_name)? {
-            Some(contents) => serde_json::from_str(&contents).map_err(|e| Error::ParseFile {
-                path: file_name.into(),
-                message: e.to_string(),
-            })?,
-            None => Config::default(),
-        };
-        config.apply_environment(env);
-        Ok(config)
+        Ok(Self::load_with_source(app, env)?.config)
+    }
+
+    /// Load configuration and report which file it came from.
+    ///
+    /// A `railpack.json` or `nixpacks.toml` is read when no `autopack.json`
+    /// exists, so an application already configured for another builder keeps
+    /// building the way its author intended. Set `AUTOPACK_COMPAT=off` to
+    /// ignore those files.
+    pub fn load_with_source(app: &App, env: &Environment) -> Result<crate::compat::Loaded> {
+        // An explicit AUTOPACK_CONFIG_FILE bypasses discovery entirely.
+        if let Some(file_name) = env.config("CONFIG_FILE") {
+            let mut config = match app.read_file_opt(file_name)? {
+                Some(contents) => {
+                    serde_json::from_str(&contents).map_err(|e| Error::ParseFile {
+                        path: file_name.into(),
+                        message: e.to_string(),
+                    })?
+                }
+                None => Config::default(),
+            };
+            config.apply_environment(env);
+            return Ok(crate::compat::Loaded {
+                config,
+                source: crate::compat::ConfigSource::Autopack,
+                notes: Vec::new(),
+            });
+        }
+
+        let compat_enabled = !matches!(
+            env.config("COMPAT").map(str::to_ascii_lowercase).as_deref(),
+            Some("off" | "0" | "false" | "no")
+        );
+
+        let mut loaded = crate::compat::load(app, compat_enabled)?;
+        loaded.config.apply_environment(env);
+        Ok(loaded)
     }
 
     /// Fold `AUTOPACK_*` settings into this config.

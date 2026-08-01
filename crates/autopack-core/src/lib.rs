@@ -29,6 +29,7 @@
 #![deny(missing_docs)]
 
 pub mod app;
+pub mod compat;
 pub mod config;
 pub mod env;
 pub mod error;
@@ -39,6 +40,7 @@ pub mod plan;
 pub mod provider;
 
 pub use app::App;
+pub use compat::ConfigSource;
 pub use config::Config;
 pub use env::Environment;
 pub use error::{Error, Result};
@@ -84,7 +86,8 @@ pub struct Analysis {
 /// Configuration is read from `autopack.json` in the app root and from
 /// `AUTOPACK_*` variables in `env`, with environment variables taking priority.
 pub fn analyze(app: &App, env: &Environment, registry: &ProviderRegistry) -> Result<Analysis> {
-    let config = Config::load(app, env)?;
+    let loaded = Config::load_with_source(app, env)?;
+    let config = loaded.config;
     let provider = registry.resolve(app, env, &config)?;
 
     let mut ctx = BuildContext::new(app, env, &config);
@@ -92,6 +95,26 @@ pub fn analyze(app: &App, env: &Environment, registry: &ProviderRegistry) -> Res
         ctx.set_lock(lock);
     }
     ctx.add_metadata("provider", provider.id());
+    if let Some(file) = loaded.source.file() {
+        ctx.add_metadata(
+            "config",
+            if loaded.source.is_compat() {
+                format!("{file} (compatibility mode)")
+            } else {
+                file.to_string()
+            },
+        );
+    }
+    // Anything a compatibility translation could not carry over is surfaced
+    // rather than dropped: a silently-ignored setting shows up as a build that
+    // behaves differently for no visible reason.
+    for (index, note) in loaded.notes.iter().enumerate() {
+        ctx.add_metadata(format!("configNote{}", index + 1), note);
+        tracing::warn!(
+            "{file}: {note}",
+            file = loaded.source.file().unwrap_or("config")
+        );
+    }
     provider.plan(&mut ctx)?;
     let plan = ctx.generate()?;
 

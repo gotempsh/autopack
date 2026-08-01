@@ -346,6 +346,73 @@ Secrets are passed by name (`autopack build . --secret DATABASE_URL`), read from
 the environment at build time, mounted with `--mount=type=secret`, and never
 written into the plan or into an image layer.
 
+## Compatibility with nixpacks and railpack
+
+An app already deployed with another builder carries a config file describing
+what its author wanted. autopack reads it, so a migration does not silently
+change how the app builds:
+
+| File | Read as |
+|---|---|
+| `autopack.json` | native |
+| `railpack.json` | compatibility mode |
+| `nixpacks.toml` | compatibility mode |
+
+Precedence is that order, and `AUTOPACK_*` variables still win over all three.
+An `autopack.json` always beats a leftover file from a previous builder — if
+someone took the trouble to write one, a stale `nixpacks.toml` must not steer
+the build. Turn the whole thing off with `AUTOPACK_COMPAT=off`.
+
+`autopack info` reports which file was used:
+
+```
+$ autopack info ./my-app
+Provider:      python
+Detected:
+  config         nixpacks.toml (compatibility mode)
+Start command: gunicorn app:app --bind 0.0.0.0:${PORT:-5000}
+```
+
+**railpack.json** translates almost exactly — autopack's config was modelled on
+Railpack's plan schema. The only real difference is that Railpack splits apt
+packages across `buildAptPackages` and `deploy.aptPackages`, which map to
+`aptPackages` and `deployAptPackages`.
+
+**nixpacks.toml** needs real translation, and cannot be complete:
+
+| nixpacks | becomes |
+|---|---|
+| `[start] cmd` | the start command |
+| `[phases.setup] aptPkgs` | `aptPackages` — a direct rename |
+| `[phases.setup] nixPkgs` | mise runtimes, with the version parsed out of the Nix attribute name (`nodejs_20` → `node@20`, `python311` → `python@3.11`) |
+| `[phases.install] cmds` | the install step |
+| `[phases.build] cmds` | the build step |
+| `[variables]` | runtime environment |
+| custom phases | **not translatable** — reported, not dropped |
+| `nixPkgs` outside the runtime map | **not translatable** — reported, not dropped |
+
+`nixPkgs` names packages in the Nix package set, which is not mise's namespace.
+Anything unrecognised is reported as a `configNote` in `autopack info` and
+logged as a warning, rather than disappearing quietly:
+
+```
+configNote1  nixPkgs with no mise equivalent were skipped: imagemagick.
+             Add them with `aptPackages` in autopack.json if they are needed.
+```
+
+Start commands are honoured exactly as written — overriding explicit
+configuration would be worse than obeying it — but a few are flagged, because
+they fail in ways whose symptom does not point at the cause:
+
+```
+configNote1  start command `dotnet run` was taken from the file as-is, but
+             `dotnet run` needs the .NET SDK, which is not in the runtime
+             image; use `dotnet <assembly>.dll`.
+```
+
+The same applies to `manage.py runserver`, `artisan serve`, `flask run`,
+`next dev` and `nodemon`.
+
 ## When autopack cannot guess
 
 A wrong guess that still builds is worse than a clear failure, so autopack
