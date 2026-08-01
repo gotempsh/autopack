@@ -1,0 +1,98 @@
+name: Public starters corpus
+
+# Builds the language starters from gotempsh/temps-examples with autopack.
+#
+# The examples in this repository were written to exercise autopack, so they
+# are a weak judge of it. This corpus was written by someone else, for a
+# different builder, and is the same set the Temps platform ships to users —
+# which makes a regression here a regression a real user would hit.
+#
+# It runs from this side rather than from temps-examples because that
+# repository is public and this one is not: a public workflow would need a
+# personal access token stored as a secret to check this repository out, and
+# secrets do not reach pull requests from forks anyway. Cloning a public repo
+# from a private one needs no credentials at all. If autopack is ever made
+# public, the reciprocal job belongs in temps-examples so its PRs get the
+# signal directly.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # The corpus moves independently of this repository.
+  schedule:
+    - cron: "0 7 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: starters-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CORPUS_REPO: gotempsh/temps-examples
+
+jobs:
+  sweep:
+    name: Build the public starters
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Check out the corpus
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.CORPUS_REPO }}
+          path: corpus
+
+      - name: Build autopack
+        run: cargo build --release -p autopack-cli
+
+      # The starters land with gotempsh/temps-examples#12. Until that merges
+      # the path does not exist, and a red X for "the corpus is not there yet"
+      # teaches people to ignore this workflow.
+      - name: Is the corpus present?
+        id: corpus
+        run: |
+          if [ -d corpus/examples/starters ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::corpus/examples/starters not found — waiting on gotempsh/temps-examples#12"
+          fi
+
+      - name: Sweep
+        id: sweep
+        if: steps.corpus.outputs.present == 'true'
+        run: |
+          set -uo pipefail
+
+          AUTOPACK=./target/release/autopack ./scripts/sweep-external.sh \
+            corpus/examples/starters | tee /tmp/sweep.txt
+
+          # The sweep prints a table and always exits zero; the gate is here,
+          # so the failure names which starter broke rather than just "sweep
+          # failed".
+          failed=$(awk 'NR>2 && ($3=="FAIL" || $3=="-")  { print $1 }' /tmp/sweep.txt)
+
+          {
+            echo "## autopack against the public starters"
+            echo
+            echo '```'
+            cat /tmp/sweep.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -n "${failed}" ]; then
+            echo "::error::autopack failed to build: $(echo ${failed} | tr '\n' ' ')"
+            exit 1
+          fi
+
+          echo "every starter built"
