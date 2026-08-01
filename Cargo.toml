@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT"
+repository = "https://github.com/gotempsh/autopack"
+homepage = "https://github.com/gotempsh/autopack"
+authors = ["Temps <hello@temps.sh>"]
+
+[workspace.dependencies]
+autopack-core = { version = "0.1.0", path = "crates/autopack-core" }
+autopack-providers = { version = "0.1.0", path = "crates/autopack-providers" }
+autopack-dockerfile = { version = "0.1.0", path = "crates/autopack-dockerfile" }
+
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+globset = "0.4"
+indexmap = { version = "2", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.10"
+thiserror = "2"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+walkdir = "2"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

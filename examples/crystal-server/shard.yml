@@ -1,0 +1,8 @@
+name: crystal_server_example
+version: 1.0.0
+
+targets:
+  crystal_server_example:
+    main: src/server.cr
+
+crystal: ">= 1.10.0"

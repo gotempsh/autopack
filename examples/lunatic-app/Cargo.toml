@@ -1,0 +1,7 @@
+[package]
+name = "lunatic-app-example"
+version = "1.0.0"
+edition = "2021"
+
+[dependencies]
+lunatic = "0.14"

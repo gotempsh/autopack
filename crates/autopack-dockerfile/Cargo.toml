@@ -1,0 +1,17 @@
+[package]
+name = "autopack-dockerfile"
+description = "Lowers an autopack build plan into a BuildKit Dockerfile"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[dependencies]
+autopack-core.workspace = true
+
+[dev-dependencies]
+autopack-providers.workspace = true
+tempfile = "3"

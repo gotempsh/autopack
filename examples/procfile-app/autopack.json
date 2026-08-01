@@ -1,0 +1,3 @@
+{
+  "deployAptPackages": ["python3"]
+}

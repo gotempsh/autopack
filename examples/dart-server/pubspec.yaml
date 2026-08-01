@@ -1,0 +1,6 @@
+name: dart_server_example
+description: autopack Dart example
+publish_to: none
+
+environment:
+  sdk: ^3.5.0

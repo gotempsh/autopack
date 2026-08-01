@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+# A push that supersedes a running build should cancel it: the conformance
+# matrix builds 31 container images and there is no value in finishing a run
+# for a commit nobody is waiting on any more.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Format, lint, test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
+
+  conformance:
+    name: Conformance
+    runs-on: ubuntu-latest
+    # Swift, Scala, Haskell and .NET pull multi-gigabyte toolchain images and
+    # compile from source; the default 6h limit is far too loose to catch a
+    # genuinely stuck build.
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { example: node-express }
+          - { example: vite-spa }
+          - { example: bun-server }
+          - { example: deno-api }
+          - { example: python-flask }
+          - { example: python-native }
+          - { example: ruby-rack }
+          - { example: ruby-native }
+          - { example: rails-app }
+          - { example: php-app }
+          - { example: php-composer }
+          - { example: php-extensions }
+          - { example: java-maven }
+          - { example: scala-app }
+          - { example: clojure-app }
+          - { example: dotnet-api }
+          - { example: elixir-release }
+          - { example: elixir-plug }
+          - { example: gleam-cli }
+          - { example: go-api }
+          - { example: rust-api }
+          - { example: lunatic-app }
+          - { example: haskell-api }
+          - { example: swift-server }
+          - { example: dart-server }
+          - { example: zig-server }
+          - { example: crystal-server }
+          - { example: cobol-app }
+          - { example: cpp-cmake }
+          - { example: procfile-app }
+          - { example: static-site }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build autopack
+        run: cargo build --release -p autopack-cli
+
+      # Conformance, not a smoke test: content, SIGTERM, $PORT, no leaked
+      # secret, no build tooling, deterministic output, install-layer reuse.
+      - name: Conformance — ${{ matrix.example }}
+        run: |
+          AUTOPACK=./target/release/autopack ./scripts/conformance.sh ${{ matrix.example }}

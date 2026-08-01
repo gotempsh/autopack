@@ -1,0 +1,38 @@
+# Rust
+/target
+**/*.rs.bk
+*.pdb
+
+# Generated build artifacts
+/Dockerfile.autopack
+/autopack-plan.json
+
+# Example apps are built inside containers, but running one locally — or
+# bind-mounting it into a toolchain image to debug — leaves its dependency
+# and output directories behind. None of that belongs in the repository.
+examples/**/node_modules/
+examples/**/vendor/
+examples/**/target/
+examples/**/dist/
+examples/**/build/
+examples/**/.next/
+examples/**/.svelte-kit/
+examples/**/.build/
+examples/**/dist-newstyle/
+examples/**/_build/
+examples/**/deps/
+examples/**/zig-out/
+examples/**/.zig-cache/
+examples/**/obj/
+examples/**/bin/Debug/
+examples/**/bin/Release/
+examples/**/.venv/
+examples/**/__pycache__/
+examples/**/.gradle/
+examples/**/.sbt/
+examples/**/project/project/
+examples/**/project/target/
+
+# Local tooling
+.DS_Store
+*.log

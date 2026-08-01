@@ -1,0 +1,10 @@
+{
+  "name": "bun-server-example",
+  "private": true,
+  "module": "server.ts",
+  "type": "module",
+  "packageManager": "bun@1.3.14",
+  "scripts": {
+    "start": "bun run server.ts"
+  }
+}

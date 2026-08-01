@@ -1,0 +1,9 @@
+source "https://rubygems.org"
+
+gem "rack", "~> 3.1"
+gem "rackup", "~> 2.2"
+gem "webrick", "~> 1.8"
+
+# A native extension: it compiles against libpq-dev and loads libpq5 at run
+# time, so a missing runtime package is a boot failure, not a build failure.
+gem "pg", "~> 1.5"

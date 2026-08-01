@@ -1,0 +1,5 @@
+flask==3.0.3
+gunicorn==22.0.0
+# Deliberately NOT psycopg2-binary: this one links against the system libpq,
+# so it needs libpq-dev to build and libpq5 to import at run time.
+psycopg2==2.9.9

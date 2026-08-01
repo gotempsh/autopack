@@ -1,0 +1,10 @@
+{
+  "name": "autopack/php-extensions-example",
+  "description": "Proves PHP extensions compiled at build time reach the runtime image",
+  "type": "project",
+  "require": {
+    "php": "^8.3",
+    "ext-intl": "*",
+    "ext-pdo_pgsql": "*"
+  }
+}
