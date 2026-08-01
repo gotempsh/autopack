@@ -32,16 +32,130 @@ already have. A native LLB backend is possible in Rust without a Go frontend —
 working proof of concept in [docs/llb-backend.md](docs/llb-backend.md) — and
 the plan format is already backend-agnostic.
 
-Embedding it in your own platform? Jump to
-[Use as a library](#use-as-a-library) — the CLI is just one caller of that API.
+## Use as a library (the SDK)
 
-## Install
+autopack is a library first and a binary second. The `autopack` CLI is one
+caller of the same API, not a privileged one — so a platform embeds the crates
+rather than shelling out to a binary and parsing its output.
+
+Not on crates.io yet, so depend on the repository directly. Pin a tag rather
+than tracking `main`, or a build tool starts changing under you between deploys:
+
+```toml
+[dependencies]
+autopack-core       = { git = "https://github.com/gotempsh/autopack", tag = "v0.1.0" }
+autopack-providers  = { git = "https://github.com/gotempsh/autopack", tag = "v0.1.0" }
+autopack-dockerfile = { git = "https://github.com/gotempsh/autopack", tag = "v0.1.0" }
+```
+
+The repository is private, so cargo needs credentials — an SSH remote
+(`git@github.com:gotempsh/autopack.git`) with an agent key, or
+`CARGO_NET_GIT_FETCH_WITH_CLI=true` and a token. In CI that means giving the
+job read access to this repository.
+
+A host that only needs to *consume* plans — store them, diff them, render them —
+can depend on `autopack-core` alone; it pulls in no providers and no backend.
+
+```rust
+use autopack_core::{analyze, App, Environment};
+use autopack_dockerfile::to_dockerfile;
+
+let app = App::new("./my-app")?;
+
+// Build the environment explicitly rather than inheriting the process's:
+// a stray AUTOPACK_* on the build host must not change a user's build.
+let mut env = Environment::from_pairs([("NODE_ENV", "production")]);
+env.set("AUTOPACK_BUILD_CMD", "npm run build:prod");  // whatever your UI collected
+env.add_secret("DATABASE_URL");                        // by name; the value never enters the plan
+
+let analysis = analyze(&app, &env, &autopack_providers::registry())?;
+
+println!("{} -> {:?}", analysis.provider, analysis.plan.deploy.start_command);
+let dockerfile = to_dockerfile(&analysis.plan)?;
+```
+
+A complete, runnable version — including typed error handling and the lock —
+is in [`crates/autopack-cli/examples/embed.rs`](crates/autopack-cli/examples/embed.rs):
+
+```bash
+cargo run --example embed -- ./examples/node-express
+```
+
+### What a host gets back
+
+`Analysis` is the whole result, and all of it is data:
+
+| Field | Use |
+|---|---|
+| `provider` | which provider claimed the app |
+| `plan` | the `BuildPlan` — serialisable, diffable, storable |
+| `metadata` | detected framework, package manager, document root … for a UI |
+| `packages` | each runtime, its version, and **where the version came from** |
+
+Because the plan round-trips through JSON, a platform can persist it, diff two
+deploys to show what changed, or hand it to a different backend later without
+re-running detection.
+
+### Errors are typed
+
+Failures a UI must present differently are separate variants, not strings:
+
+```rust
+match analyze(&app, &env, &registry) {
+    Err(Error::NoProviderDetected)  => // ask which provider to use
+    Err(Error::MissingStartCommand) => // prompt for a start command
+    Err(Error::Provider { provider, message }) => // show the provider's own guidance
+    …
+}
+```
+
+### Embedding in an existing build pipeline
+
+[docs/embedding.md](docs/embedding.md) walks through wiring autopack into a
+platform that already has its own build abstraction — including a worked
+adapter for a host whose interface is "give me a Dockerfile and build args".
+
+### Crates
+
+- `autopack-core` — plan schema, source analysis, provider trait, config merge,
+  lock. No provider or backend dependencies, so a host can depend on just this
+  to consume plans.
+- `autopack-providers` — the built-in language providers.
+- `autopack-dockerfile` — plan → BuildKit Dockerfile.
+- `autopack-cli` — the `autopack` binary.
+
+### Adding a provider
+
+One trait, and it is the same one the built-ins implement:
+
+```rust
+impl Provider for MyProvider {
+    fn id(&self) -> &'static str { "elixir" }
+
+    fn detect(&self, app: &App, _env: &Environment) -> Result<bool> {
+        Ok(app.has_file("mix.exs"))
+    }
+
+    fn plan(&self, ctx: &mut BuildContext<'_>) -> Result<()> {
+        ctx.packages.add("erlang", "27", "provider default");
+        ctx.step(steps::BUILD).add_command(Command::shell("mix release"));
+        ctx.set_start_command("/app/_build/prod/rel/app/bin/app start");
+        Ok(())
+    }
+}
+```
+
+Register it in your own `ProviderRegistry` — order is precedence — and pass
+that to `analyze` instead of `autopack_providers::registry()`.
+
+## Use from the command line
+
+The CLI is a thin wrapper over the same API — useful for trying autopack out,
+and for CI.
 
 ```bash
 cargo install --path crates/autopack-cli
 ```
-
-## Use
 
 ```bash
 autopack info .                       # what did it detect?
@@ -231,111 +345,6 @@ app root or with `AUTOPACK_*` environment variables. Environment variables win.
 Secrets are passed by name (`autopack build . --secret DATABASE_URL`), read from
 the environment at build time, mounted with `--mount=type=secret`, and never
 written into the plan or into an image layer.
-
-## Use as a library
-
-autopack is a library first and a binary second. The `autopack` CLI is one
-caller of the same API, not a privileged one — so a platform embeds the crates
-rather than shelling out to a binary and parsing its output.
-
-```toml
-[dependencies]
-autopack-core = "0.1"        # plan schema, analysis, provider trait
-autopack-providers = "0.1"   # the built-in language providers
-autopack-dockerfile = "0.1"  # plan -> BuildKit Dockerfile
-```
-
-```rust
-use autopack_core::{analyze, App, Environment};
-use autopack_dockerfile::to_dockerfile;
-
-let app = App::new("./my-app")?;
-
-// Build the environment explicitly rather than inheriting the process's:
-// a stray AUTOPACK_* on the build host must not change a user's build.
-let mut env = Environment::from_pairs([("NODE_ENV", "production")]);
-env.set("AUTOPACK_BUILD_CMD", "npm run build:prod");  // whatever your UI collected
-env.add_secret("DATABASE_URL");                        // by name; the value never enters the plan
-
-let analysis = analyze(&app, &env, &autopack_providers::registry())?;
-
-println!("{} -> {:?}", analysis.provider, analysis.plan.deploy.start_command);
-let dockerfile = to_dockerfile(&analysis.plan)?;
-```
-
-A complete, runnable version — including typed error handling and the lock —
-is in [`crates/autopack-cli/examples/embed.rs`](crates/autopack-cli/examples/embed.rs):
-
-```bash
-cargo run --example embed -- ./examples/node-express
-```
-
-### What a host gets back
-
-`Analysis` is the whole result, and all of it is data:
-
-| Field | Use |
-|---|---|
-| `provider` | which provider claimed the app |
-| `plan` | the `BuildPlan` — serialisable, diffable, storable |
-| `metadata` | detected framework, package manager, document root … for a UI |
-| `packages` | each runtime, its version, and **where the version came from** |
-
-Because the plan round-trips through JSON, a platform can persist it, diff two
-deploys to show what changed, or hand it to a different backend later without
-re-running detection.
-
-### Errors are typed
-
-Failures a UI must present differently are separate variants, not strings:
-
-```rust
-match analyze(&app, &env, &registry) {
-    Err(Error::NoProviderDetected)  => // ask which provider to use
-    Err(Error::MissingStartCommand) => // prompt for a start command
-    Err(Error::Provider { provider, message }) => // show the provider's own guidance
-    …
-}
-```
-
-### Embedding in an existing build pipeline
-
-[docs/embedding.md](docs/embedding.md) walks through wiring autopack into a
-platform that already has its own build abstraction — including a worked
-adapter for a host whose interface is "give me a Dockerfile and build args".
-
-### Crates
-
-- `autopack-core` — plan schema, source analysis, provider trait, config merge,
-  lock. No provider or backend dependencies, so a host can depend on just this
-  to consume plans.
-- `autopack-providers` — the built-in language providers.
-- `autopack-dockerfile` — plan → BuildKit Dockerfile.
-- `autopack-cli` — the `autopack` binary.
-
-### Adding a provider
-
-One trait, and it is the same one the built-ins implement:
-
-```rust
-impl Provider for MyProvider {
-    fn id(&self) -> &'static str { "elixir" }
-
-    fn detect(&self, app: &App, _env: &Environment) -> Result<bool> {
-        Ok(app.has_file("mix.exs"))
-    }
-
-    fn plan(&self, ctx: &mut BuildContext<'_>) -> Result<()> {
-        ctx.packages.add("erlang", "27", "provider default");
-        ctx.step(steps::BUILD).add_command(Command::shell("mix release"));
-        ctx.set_start_command("/app/_build/prod/rel/app/bin/app start");
-        Ok(())
-    }
-}
-```
-
-Register it in your own `ProviderRegistry` — order is precedence — and pass
-that to `analyze` instead of `autopack_providers::registry()`.
 
 ## When autopack cannot guess
 
