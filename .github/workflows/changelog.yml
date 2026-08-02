@@ -1,0 +1,111 @@
+name: Changelog
+
+# CHANGELOG.md is generated from Conventional Commits by git-cliff at release
+# time — it is NOT hand-edited in PRs (that is what used to cause a merge
+# conflict on every PR). This workflow keeps the generated changelog healthy by:
+#   1. Validating that the PR's commits follow Conventional Commits, so git-cliff
+#      can categorise them (non-conventional commits get silently dropped).
+#   2. Posting a preview of exactly what this PR will add to the changelog.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches:
+      - main
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  changelog:
+    name: Validate commits & preview changelog
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Determine PR commit range
+        id: range
+        run: |
+          set -euo pipefail
+          git fetch origin "${{ github.base_ref }}" --quiet || true
+          base="$(git merge-base "origin/${{ github.base_ref }}" HEAD 2>/dev/null || echo '${{ github.event.pull_request.base.sha }}')"
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          echo "range=$base..HEAD" >> "$GITHUB_OUTPUT"
+          echo "PR commit range: $base..HEAD"
+
+      - name: Lint Conventional Commits
+        run: |
+          set -euo pipefail
+          base='${{ steps.range.outputs.base }}'
+          # Conventional Commits: type(optional-scope)!: description
+          pattern='^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([a-z0-9/_,.-]+\))?!?: .+'
+          fail=0
+          # --no-merges: merge commits are exempt (git-cliff drops them anyway).
+          while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            sha="${line%% *}"
+            subject="${line#* }"
+            if ! printf '%s' "$subject" | grep -qE "$pattern"; then
+              echo "::error::Non-conventional commit ${sha:0:8}: $subject"
+              fail=1
+            fi
+          done < <(git log --no-merges --format='%H %s' "$base..HEAD")
+          if [ "$fail" -ne 0 ]; then
+            echo ""
+            echo "Commit subjects must follow Conventional Commits: type(scope): description"
+            echo "Types: feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert"
+            echo "CHANGELOG.md is generated from these messages, so non-conventional commits are dropped."
+            echo "Amend/rebase your commit messages, or squash-merge with a conventional title."
+            exit 1
+          fi
+          echo "✅ All commits follow Conventional Commits"
+
+      - name: Generate changelog preview
+        id: cliff
+        uses: orhun/git-cliff-action@f50e11560dce63f7c33227798f90b924471a88b5 # v4
+        with:
+          config: cliff.toml
+          args: --strip all ${{ steps.range.outputs.range }}
+        env:
+          OUTPUT: CHANGELOG_PREVIEW.md
+
+      # Posting a PR comment needs a write-scoped GITHUB_TOKEN. On pull_request
+      # runs from a fork, GitHub forces the token to read-only regardless of the
+      # `permissions:` block above, so this step 403s ("Resource not accessible
+      # by integration"). Skip it for fork PRs — the Conventional Commits lint
+      # above still runs and gates every PR; only the preview comment is skipped.
+      - name: Post preview comment
+        if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- changelog-preview -->';
+            let preview = '';
+            try { preview = fs.readFileSync('CHANGELOG_PREVIEW.md', 'utf8').trim(); } catch (e) {}
+            const header = `${marker}\n## 📓 Changelog preview\n\n`
+              + 'This is what your commits will add to the generated `CHANGELOG.md` at release '
+              + 'time (via git-cliff). **Do not edit `CHANGELOG.md` by hand** — it is generated '
+              + 'from your Conventional Commit messages.\n\n';
+            const content = preview.length
+              ? '```markdown\n' + preview + '\n```'
+              : '_No changelog-relevant commits yet (all are merge/chore/skipped)._';
+            const commentBody = header + content;
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number });
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body: commentBody });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body: commentBody });
+            }
