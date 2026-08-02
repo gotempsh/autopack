@@ -14,6 +14,9 @@ use crate::support::{
     read_version_file, CADDYFILE_PATH,
 };
 
+/// Where a Next.js standalone bundle is staged for the runtime image.
+const STANDALONE_DIR: &str = "/app/standalone";
+
 /// Node version used when the app does not pin one.
 const DEFAULT_NODE_VERSION: &str = "24";
 
@@ -124,6 +127,12 @@ impl Provider for NodeProvider {
         let static_site = static_site(ctx, &package, framework);
         match &static_site {
             Some(site) => self.plan_static_deploy(ctx, site)?,
+            // A Next.js app configured for standalone output has already told
+            // us it wants a pruned server; honouring that is the difference
+            // between a 226MB image and a 3.1GB one.
+            None if framework == Framework::Next && uses_standalone_output(ctx.app)? => {
+                self.plan_standalone_deploy(ctx)?
+            }
             None => self.plan_server_deploy(ctx, &package, manager)?,
         }
 
@@ -213,6 +222,43 @@ impl NodeProvider {
     }
 
     /// Ship the app directory and run a Node process.
+    /// Ship only the Next.js standalone bundle.
+    ///
+    /// `output: "standalone"` makes Next emit a server with just the modules it
+    /// actually imports. Shipping `/app` instead means carrying every
+    /// dependency, dev dependencies included, and the full build output — for
+    /// the Temps landing site that is 3.1GB against 226MB.
+    ///
+    /// The pieces have to be assembled: Next writes the server to
+    /// `.next/standalone`, but leaves `.next/static` and `public/` out of it,
+    /// expecting them to be placed alongside.
+    fn plan_standalone_deploy(&self, ctx: &mut BuildContext<'_>) -> Result<()> {
+        let has_public = ctx.app.has_dir("public");
+        let stage = format!(
+            "mkdir -p {STANDALONE_DIR} && \
+             cp -r .next/standalone/. {STANDALONE_DIR}/ && \
+             mkdir -p {STANDALONE_DIR}/.next && \
+             cp -r .next/static {STANDALONE_DIR}/.next/static{public}",
+            public = if has_public {
+                format!(" && cp -r public {STANDALONE_DIR}/public")
+            } else {
+                String::new()
+            }
+        );
+
+        ctx.step(steps::BUILD).add_command(Command::shell(stage));
+
+        ctx.add_deploy_input(Layer::step(steps::BUILD).including([STANDALONE_DIR]));
+        ctx.add_deploy_variable("NODE_ENV", "production");
+        // The standalone server binds to HOSTNAME, which defaults to
+        // localhost — unreachable from outside the container.
+        ctx.add_deploy_variable("HOSTNAME", "0.0.0.0");
+        ctx.add_metadata("nextOutput", "standalone");
+
+        ctx.set_start_command(format!("node {STANDALONE_DIR}/server.js"));
+        Ok(())
+    }
+
     fn plan_server_deploy(
         &self,
         ctx: &mut BuildContext<'_>,
@@ -264,6 +310,30 @@ impl NodeProvider {
 
         Ok(None)
     }
+}
+
+/// Whether `next.config.*` sets `output: "standalone"`.
+///
+/// Read as text rather than evaluated: the config is JavaScript or TypeScript
+/// and may compute values, but this setting is written literally in practice.
+fn uses_standalone_output(app: &App) -> Result<bool> {
+    for name in [
+        "next.config.ts",
+        "next.config.js",
+        "next.config.mjs",
+        "next.config.cjs",
+    ] {
+        let Some(contents) = app.read_file_opt(name)? else {
+            continue;
+        };
+        let normalised: String = contents.chars().filter(|c| !c.is_whitespace()).collect();
+        if normalised.contains("output:\"standalone\"")
+            || normalised.contains("output:'standalone'")
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Which framework the app uses, if any autopack treats specially.
@@ -484,6 +554,47 @@ mod tests {
             Some("next start")
         );
         assert_eq!(analysis.plan.deploy.variables["NODE_ENV"], "production");
+    }
+
+    #[test]
+    fn next_standalone_ships_only_the_pruned_server() {
+        // Shipping /app instead carries every dependency and the whole build
+        // output: 3.1GB against 363MB for the Temps landing site.
+        let (_dir, app) = write_app(&[
+            (
+                "package.json",
+                r#"{"dependencies":{"next":"15"},"scripts":{"build":"next build","start":"next start"}}"#,
+            ),
+            ("next.config.ts", "export default { output: 'standalone' };"),
+        ]);
+        let analysis = plan_for(&app);
+
+        assert_eq!(analysis.metadata["nextOutput"], "standalone");
+        assert_eq!(
+            analysis.plan.deploy.start_command.as_deref(),
+            Some("node /app/standalone/server.js")
+        );
+        assert_eq!(
+            analysis.plan.deploy.inputs[0].filter.include,
+            vec!["/app/standalone".to_string()]
+        );
+        // The standalone server binds HOSTNAME, which defaults to localhost.
+        assert_eq!(analysis.plan.deploy.variables["HOSTNAME"], "0.0.0.0");
+    }
+
+    #[test]
+    fn a_next_app_without_standalone_ships_the_app_directory() {
+        let (_dir, app) = write_app(&[(
+            "package.json",
+            r#"{"dependencies":{"next":"15"},"scripts":{"build":"next build","start":"next start"}}"#,
+        )]);
+        let analysis = plan_for(&app);
+
+        assert!(!analysis.metadata.contains_key("nextOutput"));
+        assert_eq!(
+            analysis.plan.deploy.start_command.as_deref(),
+            Some("next start")
+        );
     }
 
     #[test]

@@ -191,7 +191,7 @@ Nothing is written into your repository: the generated Dockerfile and its
 
 | Provider | Detected by | Handles |
 |---|---|---|
-| `node` | `package.json` | npm, pnpm, yarn (classic + berry), bun; Next, Nuxt, Remix, SvelteKit, Nest, Astro; Vite/CRA/Astro static builds served by Caddy |
+| `node` | `package.json` | npm, pnpm, yarn (classic + berry), bun; Next (incl. `output: 'standalone'`), Nuxt, Remix, SvelteKit, Nest, Astro; Vite/CRA/Astro static builds served by Caddy |
 | `deno` | `deno.json`, `deno.lock`, `main.ts` | `deno install`, `deno task build`/`start` |
 | `python` | `requirements.txt`, `pyproject.toml`, `Pipfile`, `*.py` | uv, Poetry, Pipenv, pip; Django, FastAPI, Flask entry points |
 | `ruby` | `Gemfile`, `config.ru`, `*.rb` | bundler, Rails (asset precompile), Rack |
