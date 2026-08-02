@@ -121,6 +121,13 @@ impl Provider for NodeProvider {
         ctx.build_apt_packages.extend(build_packages);
         ctx.deploy_apt_packages.extend(runtime_packages);
 
+        // pnpm 11+ is distributed as `@pnpm/exe`, a standalone binary that
+        // dynamically links libatomic.so.1. debian-slim does not ship it, so
+        // without this package `pnpm ci` fails with exit 127 before install.
+        if manager.needs_libatomic(&package) {
+            ctx.build_apt_packages.push("libatomic1".to_string());
+        }
+
         self.plan_install(ctx, &package, manager)?;
         self.plan_build(ctx, &package, manager)?;
 
@@ -173,12 +180,17 @@ impl NodeProvider {
             Layer::local().including(manifests)
         };
 
-        let install_command = manager.install_command(ctx.app);
+        let install_command = manager.install_command(ctx.app, package);
         let step = ctx.step(steps::INSTALL);
         step.add_input(manifest_layer);
         step.add_cache(cache);
         for (key, value) in cache_env {
             step.add_variable(key, value);
+        }
+        // Docker RUN has no TTY; pnpm prompts to purge node_modules unless CI
+        // is set (ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY).
+        if manager == PackageManager::Pnpm {
+            step.add_variable("CI", "true");
         }
         step.add_command(Command::shell(install_command));
         Ok(())
@@ -198,6 +210,10 @@ impl NodeProvider {
 
         let step = ctx.step(steps::BUILD);
         step.inputs = vec![Layer::step(steps::INSTALL), Layer::local()];
+        // `pnpm run` may re-invoke install for a deps check; same no-TTY rule.
+        if manager == PackageManager::Pnpm {
+            step.add_variable("CI", "true");
+        }
         if let Some(command) = build_script {
             step.add_command(Command::shell(command));
         }
@@ -636,6 +652,69 @@ mod tests {
         let install = analysis.plan.step("install").unwrap();
         let local = install.inputs.iter().find(|i| i.local).unwrap();
         assert!(local.filter.is_unfiltered());
+    }
+
+    #[test]
+    fn pnpm_installs_libatomic_for_the_standalone_binary() {
+        // pnpm 11+ is `@pnpm/exe`, which links against libatomic.so.1.
+        // debian-slim does not ship it, so `pnpm ci` exits 127 without this.
+        let (_dir, app) = write_app(&[
+            (
+                "package.json",
+                r#"{"packageManager":"pnpm@11.19.0","scripts":{"start":"node index.js"}}"#,
+            ),
+            ("pnpm-lock.yaml", ""),
+            ("index.js", ""),
+        ]);
+        let analysis = plan_for(&app);
+        let packages = analysis.plan.step("packages").unwrap();
+        assert!(
+            packages.commands[0].display_name().contains("libatomic1"),
+            "{}",
+            packages.commands[0].display_name()
+        );
+    }
+
+    #[test]
+    fn older_pnpm_does_not_install_libatomic() {
+        let (_dir, app) = write_app(&[
+            (
+                "package.json",
+                r#"{"packageManager":"pnpm@9.15.0","scripts":{"start":"node index.js"}}"#,
+            ),
+            ("pnpm-lock.yaml", ""),
+            ("index.js", ""),
+        ]);
+        let analysis = plan_for(&app);
+        let packages = analysis.plan.step("packages").unwrap();
+        assert!(
+            !packages.commands[0].display_name().contains("libatomic1"),
+            "{}",
+            packages.commands[0].display_name()
+        );
+    }
+
+    #[test]
+    fn pnpm_sets_ci_on_install_and_build() {
+        // `pnpm run build` may re-invoke install for a deps check. Without a TTY
+        // that aborts unless CI=true (ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY).
+        let (_dir, app) = write_app(&[
+            (
+                "package.json",
+                r#"{"packageManager":"pnpm@11.19.0","scripts":{"build":"tsc","start":"node index.js"}}"#,
+            ),
+            ("pnpm-lock.yaml", ""),
+            ("index.js", ""),
+        ]);
+        let analysis = plan_for(&app);
+        assert_eq!(
+            analysis.plan.step("install").unwrap().variables.get("CI"),
+            Some(&"true".to_string())
+        );
+        assert_eq!(
+            analysis.plan.step("build").unwrap().variables.get("CI"),
+            Some(&"true".to_string())
+        );
     }
 
     #[test]
