@@ -1,0 +1,5 @@
+[files]
+# Reserved for future exclude patterns (e.g. non-English READMEs).
+
+[default.extend-words]
+# Add project-specific false positives here as typos reports them.
