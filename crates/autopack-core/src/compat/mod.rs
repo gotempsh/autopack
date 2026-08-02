@@ -269,7 +269,8 @@ mod tests {
 
     #[test]
     fn a_development_start_command_is_flagged() {
-        // temps-demo-apps/dotnet/web really does say this. Honouring it is
+        // The dotnet starter in temps-examples really does say this.
+        // Honouring it is
         // correct — but it produces an image that cannot start, and the
         // symptom ("command not found") does not point at the cause.
         let (_dir, app) = app_with(&[("nixpacks.toml", "[start]\ncmd = \"dotnet run\"\n")]);
