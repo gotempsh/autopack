@@ -650,12 +650,16 @@ Known gaps, in rough priority order:
 - **No `HEALTHCHECK`.** Temps reads health config from `.temps.yaml`, but a
   generated image should still declare one for plain `docker run` users.
 
+## Contributing
+
+We welcome contributions. See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, architecture notes, commit format, and the PR process.
+
 ## Development
 
 ```bash
-cargo test                                                  # unit + example tests
-cargo clippy --workspace --all-targets -- -D warnings
-cargo fmt --all
+./scripts/setup-hooks.sh          # fmt, clippy, conventional commits
+./scripts/ci-local.sh             # same checks as GitHub CI (fmt/check/clippy)
+cargo test --workspace
 ```
 
 ## Licence
