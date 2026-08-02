@@ -48,11 +48,6 @@ autopack-providers  = { git = "https://github.com/gotempsh/autopack", tag = "v0.
 autopack-dockerfile = { git = "https://github.com/gotempsh/autopack", tag = "v0.1.0" }
 ```
 
-The repository is private, so cargo needs credentials — an SSH remote
-(`git@github.com:gotempsh/autopack.git`) with an agent key, or
-`CARGO_NET_GIT_FETCH_WITH_CLI=true` and a token. In CI that means giving the
-job read access to this repository.
-
 A host that only needs to *consume* plans — store them, diff them, render them —
 can depend on `autopack-core` alone; it pulls in no providers and no backend.
 
