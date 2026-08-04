@@ -1,4 +1,4 @@
-//! `autopack` — build container images from source, with no Dockerfile.
+//! `autopack` — build container images from source, with zero configuration.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -14,7 +14,7 @@ use autopack_dockerfile::{to_dockerfile, to_dockerignore};
 #[command(
     name = "autopack",
     version,
-    about = "Build container images from source, with no Dockerfile",
+    about = "Build container images from source, with zero configuration",
     long_about = "autopack inspects a source directory, works out how to build and run it, \
                   and produces a container image.\n\n\
                   Configure it with an autopack.json file or AUTOPACK_* environment variables."

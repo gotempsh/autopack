@@ -1,8 +1,12 @@
 //! # autopack-core
 //!
-//! Turns a source directory into a [`BuildPlan`]: a backend-agnostic
-//! description of the steps, layers, caches and runtime image needed to build
-//! and run an application, with no Dockerfile required.
+//! Turns a source directory into a [`BuildPlan`]: a description of the steps,
+//! layers, caches and runtime image needed to build and run an application,
+//! worked out from the source rather than written by hand.
+//!
+//! The plan is backend-agnostic — nothing here emits a Dockerfile. Lowering it
+//! to one is the `autopack-dockerfile` crate's job, and is the only backend
+//! today.
 //!
 //! The pipeline is three stages:
 //!
