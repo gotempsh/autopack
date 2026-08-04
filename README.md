@@ -1,8 +1,11 @@
-<img src="assets/logo.svg" alt="" width="72" align="left" hspace="4" vspace="4">
+<p align="center">
+  <img src="assets/logo.svg" alt="" width="88">
+</p>
 
-# autopack
+<h1 align="center">autopack</h1>
 
-Build container images from source code. No Dockerfile.
+<p align="center">Build container images from source code. No Dockerfile.</p>
+
 
 autopack inspects a directory, works out what it is, and produces an OCI image
 with sensible caching and a runtime image that carries only what the app needs
