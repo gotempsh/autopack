@@ -1,3 +1,5 @@
+<img src="assets/logo.svg" alt="" width="72" align="left" hspace="4" vspace="4">
+
 # autopack
 
 Build container images from source code. No Dockerfile.
