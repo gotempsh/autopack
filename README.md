@@ -4,13 +4,18 @@
 
 <h1 align="center">autopack</h1>
 
-<p align="center">Build container images from source code. No Dockerfile.</p>
+<p align="center">Build container images from source code. Zero config.</p>
 
 
 autopack inspects a directory, works out what it is, and produces an OCI image
 with sensible caching and a runtime image that carries only what the app needs
 at run time. It is written in Rust, ships as a single binary, and is usable as a
 library.
+
+You don't write a Dockerfile — autopack generates one and builds it with
+BuildKit. It is not hidden: `autopack dockerfile` prints exactly what will be
+built, so you can read it, check it in, or walk away from autopack entirely
+without having to reverse-engineer anything.
 
 It is an alternative to [Railpack](https://railpack.com) and
 [Nixpacks](https://nixpacks.com), with the same core idea — analyse, plan,
