@@ -11,8 +11,14 @@ let rendered = null;
 let failure = null;
 
 async function render() {
-  // --no-sandbox: the runtime user is unprivileged and there is no setuid
-  // helper in the image, which is the usual container configuration.
+  // --no-sandbox because the sandbox cannot work in this image anyway: the
+  // deploy COPY --chown strips the setuid bit from Chromium's helper, and the
+  // default seccomp profile blocks the user-namespace clone the layer-1
+  // sandbox needs. Know what it costs — an unsandboxed renderer means a
+  // compromised page is code execution in the container. This page is a
+  // hardcoded string, so there is nothing to compromise. An app that loads
+  // untrusted URLs should run the browser in its own container, or supply a
+  // Chromium-compatible seccomp profile, rather than copy this line.
   const browser = await chromium.launch({ args: ['--no-sandbox'] });
   try {
     const page = await browser.newPage();

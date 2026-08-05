@@ -134,7 +134,12 @@ impl Provider for NodeProvider {
 
         // The browser download has to land inside /app to survive into the
         // runtime image, and the app has to look for it there at boot.
-        let browsers = browser_tooling(&manifest);
+        let browsers = browser_tooling(&package);
+        ctx.deploy_apt_packages
+            .extend(browsers.runtime_packages.iter().cloned());
+        if !browsers.is_empty() {
+            ctx.add_metadata("browser", "chromium");
+        }
         for (key, value) in &browsers.variables {
             ctx.add_deploy_variable(*key, value);
         }
@@ -470,13 +475,21 @@ fn node_version(app: &App, package: &PackageJson) -> Result<(String, String)> {
     Ok((DEFAULT_NODE_VERSION.to_string(), "autopack default".into()))
 }
 
-/// Browser tooling an app needs wired up: where the browser is cached, and
-/// whether fetching it takes an extra command.
+/// Browser tooling an app needs wired up: the system libraries the browser
+/// links against, where it is cached, and how it is fetched.
 struct BrowserTooling {
+    /// Debian packages the runtime image needs.
+    runtime_packages: Vec<String>,
     /// Environment for the install, build and runtime stages.
     variables: Vec<(&'static str, String)>,
     /// Commands the install step runs after dependencies are in place.
     downloads: Vec<String>,
+}
+
+impl BrowserTooling {
+    fn is_empty(&self) -> bool {
+        self.runtime_packages.is_empty() && self.variables.is_empty()
+    }
 }
 
 /// Work out how to make a browser available to the app at run time.
@@ -496,31 +509,56 @@ struct BrowserTooling {
 /// it. Only Chromium is fetched, which is the browser the image carries system
 /// libraries for.
 ///
-/// The `-core` packages are deliberately absent: they never fetch a browser,
-/// so redirecting a cache they do not populate would be noise.
-fn browser_tooling(manifest: &str) -> BrowserTooling {
-    let haystack = manifest.to_ascii_lowercase();
+/// Gated on a declared *runtime* dependency rather than on the text of the
+/// manifest, which is what the apt table elsewhere uses. Two reasons the looser
+/// test does not survive here. Fetching a browser costs a 300MB image and a
+/// command run as root, so a blog whose description mentions Playwright should
+/// not pay for it — and `@playwright/test` is a devDependency of a great many
+/// frontend repos that ship a bundle of static files and never launch
+/// anything. An app that drives a browser in production declares it in
+/// `dependencies`; that is the contract.
+///
+/// The `-core` packages are absent by the same logic: they never fetch a
+/// browser, and their usual job is driving a remote one over CDP, so the local
+/// library closure would be bloat.
+fn browser_tooling(package: &PackageJson) -> BrowserTooling {
     let mut tooling = BrowserTooling {
+        runtime_packages: Vec::new(),
         variables: Vec::new(),
         downloads: Vec::new(),
     };
 
-    if crate::native::mentions(&haystack, "playwright") {
+    let playwright = ["playwright", "@playwright/test"]
+        .iter()
+        .any(|name| package.dependencies.contains_key(*name));
+    let puppeteer = package.dependencies.contains_key("puppeteer");
+
+    if playwright {
         // `0` is Playwright's own opt-in for "install beside the package",
         // which puts the browser under node_modules and therefore under /app.
         tooling
             .variables
             .push(("PLAYWRIGHT_BROWSERS_PATH", "0".to_string()));
-        // `npx` rather than the detected package manager's runner: npm ships
-        // with Node, so this works the same for a pnpm, yarn or bun project.
+        // `--no-install` rather than `--yes`: the dependency is installed by
+        // the command just above, so a resolution failure means the detection
+        // was wrong, and failing is better than fetching an unpinned package
+        // from the registry and running it as root. `npx` rather than the
+        // detected package manager's runner because npm ships with Node, so
+        // this works the same for a pnpm, yarn or bun project.
         tooling
             .downloads
-            .push("npx --yes playwright install chromium".to_string());
+            .push("npx --no-install playwright install chromium".to_string());
     }
-    if crate::native::mentions(&haystack, "puppeteer") {
+    if puppeteer {
         tooling
             .variables
             .push(("PUPPETEER_CACHE_DIR", format!("{APP_DIR}/.cache/puppeteer")));
+    }
+    if playwright || puppeteer {
+        tooling.runtime_packages = crate::native::CHROMIUM_RUNTIME
+            .iter()
+            .map(|package| (*package).to_string())
+            .collect();
     }
 
     tooling
@@ -952,6 +990,65 @@ mod tests {
         );
         // Puppeteer's own postinstall fetches the browser, so adding a
         // download command would download it a second time.
+        assert!(!analysis
+            .plan
+            .step("install")
+            .unwrap()
+            .commands
+            .iter()
+            .any(|c| c.display_name().contains("playwright install")));
+    }
+
+    #[test]
+    fn a_text_mention_does_not_fetch_a_browser() {
+        // Detection used to read the whole manifest, so a blog whose
+        // description mentioned Playwright had `playwright install` run as
+        // root in its build — fetching an unpinned package it never declared.
+        for manifest in [
+            r#"{"description":"A blog. We test it with playwright.","dependencies":{"express":"^4"},"scripts":{"start":"node s.js"}}"#,
+            r#"{"keywords":["scraping","playwright","puppeteer"],"dependencies":{"express":"^4"},"scripts":{"start":"node s.js"}}"#,
+            r#"{"dependencies":{"express":"^4"},"scripts":{"start":"node s.js","test":"playwright test"}}"#,
+        ] {
+            let (_dir, app) = write_app(&[
+                ("package.json", manifest),
+                ("package-lock.json", "{}"),
+                ("s.js", ""),
+            ]);
+            let analysis = plan_for(&app);
+            let install = analysis.plan.step("install").unwrap();
+            assert!(
+                !install
+                    .commands
+                    .iter()
+                    .any(|c| c.display_name().contains("playwright install")),
+                "{manifest}"
+            );
+            assert!(
+                !analysis.plan.step("runtime").unwrap().commands[0]
+                    .display_name()
+                    .contains("libnss3"),
+                "{manifest}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_dev_dependency_browser_is_not_shipped() {
+        // `@playwright/test` is a devDependency of a great many frontend
+        // repos. This one is a Vite SPA: the runtime image is Caddy plus a
+        // dist directory, with no Node and nowhere to launch a browser.
+        let (_dir, app) = write_app(&[
+            (
+                "package.json",
+                r#"{"devDependencies":{"vite":"^5","@playwright/test":"^1.62"},"scripts":{"build":"vite build"}}"#,
+            ),
+            ("package-lock.json", "{}"),
+            ("index.html", ""),
+        ]);
+        let analysis = plan_for(&app);
+        assert!(!analysis.plan.step("runtime").unwrap().commands[0]
+            .display_name()
+            .contains("libnss3"));
         assert!(!analysis
             .plan
             .step("install")
