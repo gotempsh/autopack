@@ -61,6 +61,16 @@ jobs:
             *)   echo "prerelease=false" >> "$GITHUB_OUTPUT" ;;
           esac
 
+      # CHANGELOG.md is regenerated as part of the version bump. If it has no
+      # section for this tag, the bump commit forgot it and the release would
+      # ship notes that stop at the previous version.
+      - name: Changelog must cover the tag
+        run: |
+          if ! grep -q "^## \[${GITHUB_REF_NAME#v}\]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no section for ${GITHUB_REF_NAME}. Run: git-cliff --tag ${GITHUB_REF_NAME} -o CHANGELOG.md"
+            exit 1
+          fi
+
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
@@ -157,12 +167,24 @@ jobs:
           rm -f *.sha256
           ls -l
 
+      # The repository's contract is that release notes come from git-cliff
+      # reading Conventional Commits — the same generator the PR preview uses,
+      # so what a contributor was shown on their PR is what ships. GitHub's
+      # own --generate-notes would be a second, disagreeing source of truth.
+      - name: Release notes
+        uses: orhun/git-cliff-action@f50e11560dce63f7c33227798f90b924471a88b5 # v4
+        with:
+          config: cliff.toml
+          args: --latest --strip all
+        env:
+          OUTPUT: RELEASE_NOTES.md
+
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "$GITHUB_REF_NAME" \
             --title "$GITHUB_REF_NAME" \
-            --generate-notes \
+            --notes-file RELEASE_NOTES.md \
             ${{ needs.guard.outputs.prerelease == 'true' && '--prerelease' || '' }} \
             dist/*
