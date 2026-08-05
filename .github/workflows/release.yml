@@ -96,8 +96,12 @@ jobs:
             runner: ubuntu-latest
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-24.04-arm
+          # Both macOS targets build on Apple silicon: the macos-13 Intel
+          # image is retired, and its label simply never gets a runner —
+          # the job queues forever rather than failing. Apple's SDK is
+          # multi-arch, so cross-compiling the Intel binary here is free.
           - target: x86_64-apple-darwin
-            runner: macos-13
+            runner: macos-14
           - target: aarch64-apple-darwin
             runner: macos-14
     steps:
