@@ -343,7 +343,12 @@ mod tests {
     fn pnpm_10_uses_a_frozen_install() {
         // pnpm 10 has no `ci` subcommand; CI=true is set on the step instead.
         let (_d, app) = app_with(&["package.json", "pnpm-lock.yaml"]);
-        for pin in ["pnpm@10.12.0", "pnpm@^10.15.0", "pnpm@>=10", "pnpm@v10.15.0"] {
+        for pin in [
+            "pnpm@10.12.0",
+            "pnpm@^10.15.0",
+            "pnpm@>=10",
+            "pnpm@v10.15.0",
+        ] {
             let package = PackageJson {
                 package_manager: Some(pin.into()),
                 ..Default::default()
