@@ -158,6 +158,18 @@ that to `analyze` instead of `autopack_providers::registry()`.
 The CLI is a thin wrapper over the same API — useful for trying autopack out,
 and for CI.
 
+Every tagged release publishes a static binary for Linux (x86_64, aarch64) and
+macOS (Intel, Apple silicon), with a `SHA256SUMS` file alongside them:
+
+```bash
+VERSION=0.1.0
+TARGET=aarch64-apple-darwin   # or x86_64-unknown-linux-musl, aarch64-unknown-linux-musl, x86_64-apple-darwin
+curl -fsSL "https://github.com/gotempsh/autopack/releases/download/v${VERSION}/autopack-${VERSION}-${TARGET}.tar.gz" \
+  | tar -xz --strip-components=1 -C /usr/local/bin "autopack-${VERSION}-${TARGET}/autopack"
+```
+
+Or build it yourself:
+
 ```bash
 cargo install --path crates/autopack-cli
 ```
