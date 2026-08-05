@@ -127,7 +127,7 @@ impl Provider for NodeProvider {
         // The runtime stage also copies `/mise` (and puts shims on PATH), so
         // non-simple start scripts that fall back to `pnpm run start` need the
         // same library at boot.
-        if manager.needs_libatomic(&package) {
+        if manager.needs_libatomic(&package, ctx.lock()) {
             ctx.build_apt_packages.push("libatomic1".to_string());
             ctx.deploy_apt_packages.push("libatomic1".to_string());
         }
@@ -184,7 +184,7 @@ impl NodeProvider {
             Layer::local().including(manifests)
         };
 
-        let install_command = manager.install_command(ctx.app, package);
+        let install_command = manager.install_command(ctx.app, package, ctx.lock());
         let step = ctx.step(steps::INSTALL);
         step.add_input(manifest_layer);
         step.add_cache(cache);
@@ -701,6 +701,37 @@ mod tests {
             runtime.commands[0].display_name().contains("libatomic1"),
             "{}",
             runtime.commands[0].display_name()
+        );
+    }
+
+    #[test]
+    fn a_pin_naming_another_manager_does_not_select_pnpm_ci() {
+        // `detect` lets the lockfile win, so this is a pnpm app. Honouring
+        // npm's version number as pnpm's installs pnpm 7, where `ci` is not a
+        // command — pnpm aliases the app's own `ci` script instead, and the
+        // install step exits 0 having installed nothing from the lockfile.
+        let (_dir, app) = write_app(&[
+            (
+                "package.json",
+                r#"{"packageManager":"npm@7.33.5","scripts":{"ci":"echo pwned","start":"node index.js"}}"#,
+            ),
+            ("pnpm-lock.yaml", ""),
+            ("index.js", ""),
+        ]);
+        let analysis = plan_for(&app);
+        let install = analysis.plan.step("install").unwrap();
+        assert_eq!(
+            install.commands[0].display_name(),
+            "pnpm install --frozen-lockfile"
+        );
+        let packages = analysis.plan.step("packages").unwrap();
+        assert!(
+            packages
+                .assets
+                .values()
+                .any(|a| a.contains("pnpm = \"latest\"")),
+            "{:?}",
+            packages.assets
         );
     }
 

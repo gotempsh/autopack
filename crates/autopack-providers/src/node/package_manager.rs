@@ -1,6 +1,6 @@
 //! Which JavaScript package manager the app uses, and how to drive it.
 
-use autopack_core::App;
+use autopack_core::{App, Lock};
 
 use super::package_json::PackageJson;
 use crate::support::normalize_version_range;
@@ -31,23 +31,9 @@ fn invokes_bun(package: &PackageJson) -> bool {
     })
 }
 
-/// Major version from a `packageManager` pin such as `pnpm@10.12.0`.
-///
-/// Shares [`normalize_version_range`] with [`PackageManager::mise_tool`] so
-/// range forms (`^10`, `>=10`, `v10.15.0`, `10.x`) agree on the major.
-fn pinned_major(package: &PackageJson, name: &str) -> Option<u32> {
-    package
-        .package_manager
-        .as_deref()
-        .filter(|pinned| pinned.starts_with(name))
-        .and_then(|pinned| pinned.split_once('@'))
-        .and_then(|(_, version)| normalize_version_range(version))
-        .and_then(|version| {
-            version
-                .split('.')
-                .next()
-                .and_then(|major| major.parse().ok())
-        })
+/// Major version of `version`, e.g. `10.12.0` -> `10`.
+fn major_of(version: &str) -> Option<u32> {
+    version.split('.').next()?.parse().ok()
 }
 
 impl PackageManager {
@@ -110,14 +96,46 @@ impl PackageManager {
         }
     }
 
+    /// The version requested by the `packageManager` pin, if that pin actually
+    /// names *this* manager.
+    ///
+    /// The name check matters because [`Self::detect`] lets a lockfile outvote
+    /// the pin: a repo with `pnpm-lock.yaml` and `"packageManager": "npm@7.33.5"`
+    /// is a pnpm app. Taking the version without the name installs pnpm at
+    /// npm's version number — and pnpm 7 has no `ci` command, so it aliases the
+    /// app's own `ci` script instead and the install silently does nothing.
+    fn pinned_version(self, package: &PackageJson) -> Option<String> {
+        let (name, version) = package.package_manager.as_deref()?.split_once('@')?;
+        (name == self.id()).then(|| normalize_version_range(version))?
+    }
+
+    /// The version that will actually be installed.
+    ///
+    /// `autopack.lock` outranks the pin, mirroring the substitution
+    /// [`autopack_core::BuildContext`] applies when it writes `mise.toml`.
+    /// `None` means mise resolves `latest` at build time.
+    ///
+    /// Every decision that depends on the manager's version must go through
+    /// here. Re-deriving it from `package.json` produces a plan that runs
+    /// subcommands the installed binary does not have.
+    pub fn resolved_version(self, package: &PackageJson, lock: Option<&Lock>) -> Option<String> {
+        let tool = self.mise_tool(package)?.0;
+        lock.and_then(|lock| lock.tool(tool))
+            .map(String::from)
+            .or_else(|| self.pinned_version(package))
+    }
+
+    /// Major version of [`Self::resolved_version`].
+    fn resolved_major(self, package: &PackageJson, lock: Option<&Lock>) -> Option<u32> {
+        self.resolved_version(package, lock)
+            .as_deref()
+            .and_then(major_of)
+    }
+
     /// The mise tool that provides this package manager, if it is not bundled
     /// with Node itself. npm ships with Node, so it needs no extra tool.
     pub fn mise_tool(self, package: &PackageJson) -> Option<(&'static str, String)> {
-        let pinned_version = package
-            .package_manager
-            .as_deref()
-            .and_then(|pinned| pinned.split_once('@'))
-            .and_then(|(_, version)| normalize_version_range(version));
+        let pinned_version = self.pinned_version(package);
 
         match self {
             Self::Npm => None,
@@ -131,10 +149,16 @@ impl PackageManager {
     /// Whether the installed binary needs `libatomic1` on debian-slim.
     ///
     /// pnpm 11+ is distributed as `@pnpm/exe`, which dynamically links
-    /// `libatomic.so.1`. Unpinned installs resolve to latest (11+), so they
-    /// need it too; older pins do not.
-    pub fn needs_libatomic(self, package: &PackageJson) -> bool {
-        self == Self::Pnpm && pinned_major(package, "pnpm").is_none_or(|major| major >= 11)
+    /// `libatomic.so.1`; older majors do not need it.
+    ///
+    /// An unresolvable version counts as needing it — mise resolves `latest`,
+    /// which is 11+ — and erring that way is deliberate: over-installing a
+    /// 10KB library costs nothing, omitting it is a loader failure at boot.
+    pub fn needs_libatomic(self, package: &PackageJson, lock: Option<&Lock>) -> bool {
+        self == Self::Pnpm
+            && self
+                .resolved_major(package, lock)
+                .is_none_or(|major| major >= 11)
     }
 
     /// The install command, honouring whether a lockfile is present.
@@ -143,13 +167,17 @@ impl PackageManager {
     /// which is the correct behaviour for a reproducible build. Without a
     /// lockfile there is nothing to freeze, so a plain install is used.
     ///
-    /// For pnpm the command also depends on the pinned major version:
-    /// - 11+ (and unpinned latest): `pnpm ci`
-    /// - earlier with a lockfile: `pnpm install --frozen-lockfile`
+    /// For pnpm the command also depends on the version that will be installed:
+    /// `pnpm ci` only from 11, anything else keeps the frozen install.
     ///
     /// `CI=true` is set on the install/build steps separately — do not prefix
     /// it into this command string.
-    pub fn install_command(self, app: &App, package: &PackageJson) -> &'static str {
+    pub fn install_command(
+        self,
+        app: &App,
+        package: &PackageJson,
+        lock: Option<&Lock>,
+    ) -> &'static str {
         match self {
             Self::Npm => {
                 if app.has_any_file(["package-lock.json", "npm-shrinkwrap.json"]) {
@@ -160,10 +188,14 @@ impl PackageManager {
             }
             Self::Pnpm => {
                 if app.has_file("pnpm-lock.yaml") {
-                    match pinned_major(package, "pnpm") {
-                        Some(major) if major < 11 => "pnpm install --frozen-lockfile",
-                        // 11+ and unpinned latest: `pnpm ci` is the durable CI install.
-                        _ => "pnpm ci",
+                    match self.resolved_major(package, lock) {
+                        // `pnpm ci` landed in 11.0. Everything else — including
+                        // a version we cannot resolve — takes the frozen
+                        // install: every major supports it, and unlike `ci` on
+                        // an older pnpm it can never be shadowed by a
+                        // same-named script in the app's package.json.
+                        Some(major) if major >= 11 => "pnpm ci",
+                        _ => "pnpm install --frozen-lockfile",
                     }
                 } else {
                     "pnpm install"
@@ -330,11 +362,11 @@ mod tests {
         let (_d2, without_lock) = app_with(&["package.json"]);
         let package = PackageJson::default();
         assert_eq!(
-            PackageManager::Npm.install_command(&with_lock, &package),
+            PackageManager::Npm.install_command(&with_lock, &package, None),
             "npm ci"
         );
         assert_eq!(
-            PackageManager::Npm.install_command(&without_lock, &package),
+            PackageManager::Npm.install_command(&without_lock, &package, None),
             "npm install"
         );
     }
@@ -354,7 +386,7 @@ mod tests {
                 ..Default::default()
             };
             assert_eq!(
-                PackageManager::Pnpm.install_command(&app, &package),
+                PackageManager::Pnpm.install_command(&app, &package, None),
                 "pnpm install --frozen-lockfile",
                 "{pin}"
             );
@@ -371,7 +403,7 @@ mod tests {
                 ..Default::default()
             };
             assert_eq!(
-                PackageManager::Pnpm.install_command(&app, &package),
+                PackageManager::Pnpm.install_command(&app, &package, None),
                 "pnpm ci",
                 "{pin}"
             );
@@ -379,12 +411,15 @@ mod tests {
     }
 
     #[test]
-    fn unpinned_pnpm_uses_pnpm_ci() {
-        // mise installs "latest", which is 11+ for the foreseeable future.
+    fn unpinned_pnpm_keeps_the_frozen_install() {
+        // mise resolves "latest" at build time, so the major is unknowable
+        // here. `pnpm install --frozen-lockfile` works on every major; `ci`
+        // would break the moment "latest" is not 11+ (an offline mise cache,
+        // an internal mirror still serving 10.x).
         let (_d, app) = app_with(&["package.json", "pnpm-lock.yaml"]);
         assert_eq!(
-            PackageManager::Pnpm.install_command(&app, &PackageJson::default()),
-            "pnpm ci"
+            PackageManager::Pnpm.install_command(&app, &PackageJson::default(), None),
+            "pnpm install --frozen-lockfile"
         );
     }
 
@@ -396,7 +431,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            PackageManager::Pnpm.install_command(&app, &package),
+            PackageManager::Pnpm.install_command(&app, &package, None),
             "pnpm install --frozen-lockfile"
         );
     }
@@ -409,7 +444,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            PackageManager::Pnpm.install_command(&app, &package),
+            PackageManager::Pnpm.install_command(&app, &package, None),
             "pnpm install"
         );
     }
@@ -426,27 +461,105 @@ mod tests {
     }
 
     #[test]
-    fn pinned_major_reads_the_major_from_package_manager() {
-        for (pin, major) in [
-            ("pnpm@10.12.0", Some(10)),
-            ("pnpm@^10.15.0", Some(10)),
-            ("pnpm@>=10", Some(10)),
-            ("pnpm@v10.15.0", Some(10)),
-            ("pnpm@10.x", Some(10)),
-            ("pnpm@10", Some(10)),
+    fn resolved_version_reads_ranges_and_prefers_the_lock() {
+        for (pin, version) in [
+            ("pnpm@10.12.0", Some("10.12.0")),
+            ("pnpm@^10.15.0", Some("10.15.0")),
+            ("pnpm@>=10", Some("10")),
+            ("pnpm@v10.15.0", Some("10.15.0")),
+            ("pnpm@10.x", Some("10")),
+            ("pnpm@10", Some("10")),
         ] {
             let package = PackageJson {
                 package_manager: Some(pin.into()),
                 ..Default::default()
             };
-            assert_eq!(pinned_major(&package, "pnpm"), major, "{pin}");
+            assert_eq!(
+                PackageManager::Pnpm
+                    .resolved_version(&package, None)
+                    .as_deref(),
+                version,
+                "{pin}"
+            );
         }
-        let package = PackageJson {
+
+        // A pin naming a different manager is not this manager's version.
+        // `detect` lets the lockfile win, so this repo is a pnpm app — but
+        // 7.33.5 is npm's version and must not be installed as pnpm's.
+        let mismatched = PackageJson {
+            package_manager: Some("npm@7.33.5".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            PackageManager::Pnpm.resolved_version(&mismatched, None),
+            None
+        );
+        assert_eq!(
+            PackageManager::Pnpm.mise_tool(&mismatched),
+            Some(("pnpm", "latest".to_string()))
+        );
+
+        // autopack.lock outranks the pin, matching what lands in mise.toml.
+        let pinned_11 = PackageJson {
+            package_manager: Some("pnpm@11.19.0".into()),
+            ..Default::default()
+        };
+        let mut lock = Lock::new();
+        lock.tools.insert("pnpm".into(), "10.15.0".into());
+        assert_eq!(
+            PackageManager::Pnpm
+                .resolved_version(&pinned_11, Some(&lock))
+                .as_deref(),
+            Some("10.15.0")
+        );
+
+        assert_eq!(
+            PackageManager::Pnpm.resolved_version(&PackageJson::default(), None),
+            None
+        );
+    }
+
+    #[test]
+    fn install_command_follows_the_version_that_gets_installed() {
+        let (_d, app) = app_with(&["package.json", "pnpm-lock.yaml"]);
+
+        // A pin for a different manager must not select `pnpm ci`: mise would
+        // install pnpm 7, where `ci` is not a command and pnpm aliases the
+        // app's own `ci` script instead, silently skipping the install.
+        let mismatched = PackageJson {
+            package_manager: Some("npm@7.33.5".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            PackageManager::Pnpm.install_command(&app, &mismatched, None),
+            "pnpm install --frozen-lockfile"
+        );
+
+        // A stale lock pinning pnpm 10 beats a package.json bumped to 11.
+        let pinned_11 = PackageJson {
+            package_manager: Some("pnpm@11.19.0".into()),
+            ..Default::default()
+        };
+        let mut stale = Lock::new();
+        stale.tools.insert("pnpm".into(), "10.15.0".into());
+        assert_eq!(
+            PackageManager::Pnpm.install_command(&app, &pinned_11, Some(&stale)),
+            "pnpm install --frozen-lockfile"
+        );
+        assert!(!PackageManager::Pnpm.needs_libatomic(&pinned_11, Some(&stale)));
+
+        // ...and a lock pinning 11 beats a package.json still on 10.
+        let pinned_10 = PackageJson {
             package_manager: Some("pnpm@10.12.0".into()),
             ..Default::default()
         };
-        assert_eq!(pinned_major(&package, "yarn"), None);
-        assert_eq!(pinned_major(&PackageJson::default(), "pnpm"), None);
+        let mut ahead = Lock::new();
+        ahead.tools.insert("pnpm".into(), "11.19.0".into());
+        assert_eq!(
+            PackageManager::Pnpm.install_command(&app, &pinned_10, Some(&ahead)),
+            "pnpm ci"
+        );
+        assert!(PackageManager::Pnpm.needs_libatomic(&pinned_10, Some(&ahead)));
     }
 
     #[test]
@@ -459,9 +572,9 @@ mod tests {
             package_manager: Some("pnpm@9.15.0".into()),
             ..Default::default()
         };
-        assert!(PackageManager::Pnpm.needs_libatomic(&v11));
-        assert!(PackageManager::Pnpm.needs_libatomic(&PackageJson::default()));
-        assert!(!PackageManager::Pnpm.needs_libatomic(&v9));
-        assert!(!PackageManager::Npm.needs_libatomic(&v11));
+        assert!(PackageManager::Pnpm.needs_libatomic(&v11, None));
+        assert!(PackageManager::Pnpm.needs_libatomic(&PackageJson::default(), None));
+        assert!(!PackageManager::Pnpm.needs_libatomic(&v9, None));
+        assert!(!PackageManager::Npm.needs_libatomic(&v11, None));
     }
 }
