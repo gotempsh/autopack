@@ -30,7 +30,7 @@ pub struct NativeDependency {
 }
 
 /// Chromium's shared library closure, needed by headless browsers.
-const CHROMIUM_RUNTIME: &[&str] = &[
+pub(crate) const CHROMIUM_RUNTIME: &[&str] = &[
     "libnss3",
     "libnspr4",
     "libatk1.0-0",
@@ -70,11 +70,6 @@ pub const NODE: &[NativeDependency] = &[
             "libgif7",
             "librsvg2-2",
         ],
-    },
-    NativeDependency {
-        package: "puppeteer",
-        build: &[],
-        runtime: CHROMIUM_RUNTIME,
     },
     // node-gyp shells out to a C toolchain and python3.
     NativeDependency {
@@ -239,7 +234,7 @@ pub fn required_packages(manifest: &str, table: &[NativeDependency]) -> (Vec<Str
 /// A substring test would match `psycopg2` inside `psycopg2-binary`, which
 /// bundles its own libpq and needs nothing — and would pull `libpq-dev` into
 /// every build that uses the wheel.
-fn mentions(haystack: &str, needle: &str) -> bool {
+pub(crate) fn mentions(haystack: &str, needle: &str) -> bool {
     haystack.match_indices(needle).any(|(index, _)| {
         let before = haystack[..index].chars().next_back();
         let after = haystack[index + needle.len()..].chars().next();
@@ -289,12 +284,6 @@ mod tests {
         assert!(runtime.contains(&"libcairo2".to_string()));
         // The -dev package must not leak into the runtime image.
         assert!(!runtime.iter().any(|p| p.ends_with("-dev")), "{runtime:?}");
-    }
-
-    #[test]
-    fn puppeteer_pulls_the_chromium_closure() {
-        let (_, runtime) = required_packages(r#"{"dependencies":{"puppeteer":"^23"}}"#, NODE);
-        assert!(runtime.contains(&"libnss3".to_string()));
     }
 
     #[test]

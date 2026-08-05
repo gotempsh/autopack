@@ -1,0 +1,14 @@
+{
+  "name": "playwright-app-example",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "playwright": "^1.62.1"
+  }
+}

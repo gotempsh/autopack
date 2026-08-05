@@ -54,6 +54,7 @@ jobs:
       matrix:
         include:
           - { example: node-express }
+          - { example: playwright-app }
           - { example: vite-spa }
           - { example: bun-server }
           - { example: deno-api }
