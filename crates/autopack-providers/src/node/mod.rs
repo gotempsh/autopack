@@ -132,8 +132,15 @@ impl Provider for NodeProvider {
             ctx.deploy_apt_packages.push("libatomic1".to_string());
         }
 
-        self.plan_install(ctx, &package, manager)?;
-        self.plan_build(ctx, &package, manager)?;
+        // The browser download has to land inside /app to survive into the
+        // runtime image, and the app has to look for it there at boot.
+        let browsers = browser_tooling(&manifest);
+        for (key, value) in &browsers.variables {
+            ctx.add_deploy_variable(*key, value);
+        }
+
+        self.plan_install(ctx, &package, manager, &browsers)?;
+        self.plan_build(ctx, &package, manager, &browsers)?;
 
         let static_site = static_site(ctx, &package, framework);
         match &static_site {
@@ -159,6 +166,7 @@ impl NodeProvider {
         ctx: &mut BuildContext<'_>,
         package: &PackageJson,
         manager: PackageManager,
+        browsers: &BrowserTooling,
     ) -> Result<()> {
         let (cache_dir, cache_env) = manager.cache();
         let cache = ctx.shared_cache(format!("{}-store", manager.id()), cache_dir);
@@ -196,7 +204,13 @@ impl NodeProvider {
         if manager == PackageManager::Pnpm {
             step.add_variable("CI", "true");
         }
+        for (key, value) in &browsers.variables {
+            step.add_variable(*key, value);
+        }
         step.add_command(Command::shell(install_command));
+        for download in &browsers.downloads {
+            step.add_command(Command::shell(download.clone()));
+        }
         Ok(())
     }
 
@@ -207,6 +221,7 @@ impl NodeProvider {
         ctx: &mut BuildContext<'_>,
         package: &PackageJson,
         manager: PackageManager,
+        browsers: &BrowserTooling,
     ) -> Result<()> {
         let build_script = package
             .script("build")
@@ -217,6 +232,11 @@ impl NodeProvider {
         // `pnpm run` may re-invoke install for a deps check; same no-TTY rule.
         if manager == PackageManager::Pnpm {
             step.add_variable("CI", "true");
+        }
+        // `pnpm run build` can re-invoke install, which would re-download the
+        // browser to the default cache without this.
+        for (key, value) in &browsers.variables {
+            step.add_variable(*key, value);
         }
         if let Some(command) = build_script {
             step.add_command(Command::shell(command));
@@ -450,6 +470,62 @@ fn node_version(app: &App, package: &PackageJson) -> Result<(String, String)> {
     Ok((DEFAULT_NODE_VERSION.to_string(), "autopack default".into()))
 }
 
+/// Browser tooling an app needs wired up: where the browser is cached, and
+/// whether fetching it takes an extra command.
+struct BrowserTooling {
+    /// Environment for the install, build and runtime stages.
+    variables: Vec<(&'static str, String)>,
+    /// Commands the install step runs after dependencies are in place.
+    downloads: Vec<String>,
+}
+
+/// Work out how to make a browser available to the app at run time.
+///
+/// Puppeteer and Playwright both fetch a browser out of band, by default into
+/// a cache under `$HOME`. Neither location survives into the runtime image:
+/// the deploy layer carries only `/app`, and the two stages do not even agree
+/// on `$HOME` — the build runs as root while the runtime user is `autopack`.
+/// The result is a build that looks clean and an app that fails on first use
+/// with "Could not find Chrome ... cache path is ...
+/// /home/autopack/.cache/puppeteer". Pointing both tools at `/app` makes the
+/// browser travel with the app.
+///
+/// They differ in how the browser arrives: Puppeteer downloads it from its own
+/// postinstall hook, while Playwright leaves it to an explicit
+/// `playwright install` and otherwise fails at launch telling the user to run
+/// it. Only Chromium is fetched, which is the browser the image carries system
+/// libraries for.
+///
+/// The `-core` packages are deliberately absent: they never fetch a browser,
+/// so redirecting a cache they do not populate would be noise.
+fn browser_tooling(manifest: &str) -> BrowserTooling {
+    let haystack = manifest.to_ascii_lowercase();
+    let mut tooling = BrowserTooling {
+        variables: Vec::new(),
+        downloads: Vec::new(),
+    };
+
+    if crate::native::mentions(&haystack, "playwright") {
+        // `0` is Playwright's own opt-in for "install beside the package",
+        // which puts the browser under node_modules and therefore under /app.
+        tooling
+            .variables
+            .push(("PLAYWRIGHT_BROWSERS_PATH", "0".to_string()));
+        // `npx` rather than the detected package manager's runner: npm ships
+        // with Node, so this works the same for a pnpm, yarn or bun project.
+        tooling
+            .downloads
+            .push("npx --yes playwright install chromium".to_string());
+    }
+    if crate::native::mentions(&haystack, "puppeteer") {
+        tooling
+            .variables
+            .push(("PUPPETEER_CACHE_DIR", format!("{APP_DIR}/.cache/puppeteer")));
+    }
+
+    tooling
+}
+
 /// True when a script body is a single command that can be exec'd directly.
 fn is_simple_command(script: &str) -> bool {
     !script.contains("&&")
@@ -466,6 +542,7 @@ fn is_simple_command(script: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use crate::test_support::{plan_for, plan_with_env, write_app};
+    use autopack_core::APP_DIR;
 
     #[test]
     fn detects_npm_and_plans_install_and_build() {
@@ -781,6 +858,126 @@ mod tests {
             analysis.plan.step("build").unwrap().variables.get("CI"),
             Some(&"true".to_string())
         );
+    }
+
+    #[test]
+    fn playwright_gets_the_chromium_libraries_and_an_in_app_browser_cache() {
+        // The browser is downloaded during install. Left at its default
+        // location it lands under $HOME, which the deploy layer never carries
+        // — and the build runs as root while the runtime user is `autopack`,
+        // so the two do not even agree on where $HOME is.
+        let (_dir, app) = write_app(&[
+            (
+                "package.json",
+                r#"{"dependencies":{"playwright":"^1.62.0"},"scripts":{"start":"node server.js"}}"#,
+            ),
+            ("package-lock.json", "{}"),
+            ("server.js", ""),
+        ]);
+        let analysis = plan_for(&app);
+
+        let runtime = analysis.plan.step("runtime").unwrap();
+        assert!(
+            runtime.commands[0].display_name().contains("libnss3"),
+            "{}",
+            runtime.commands[0].display_name()
+        );
+
+        for step in ["install", "build"] {
+            assert_eq!(
+                analysis
+                    .plan
+                    .step(step)
+                    .unwrap()
+                    .variables
+                    .get("PLAYWRIGHT_BROWSERS_PATH"),
+                Some(&"0".to_string()),
+                "{step}"
+            );
+        }
+
+        // Playwright does not fetch a browser from a postinstall hook the way
+        // Puppeteer does; without this the app starts and then tells the user
+        // to run `npx playwright install`.
+        let install = analysis.plan.step("install").unwrap();
+        assert!(
+            install
+                .commands
+                .iter()
+                .any(|c| c.display_name().contains("playwright install chromium")),
+            "{:?}",
+            install
+                .commands
+                .iter()
+                .map(|c| c.display_name())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            analysis
+                .plan
+                .deploy
+                .variables
+                .get("PLAYWRIGHT_BROWSERS_PATH"),
+            Some(&"0".to_string())
+        );
+    }
+
+    #[test]
+    fn puppeteer_cache_is_redirected_under_the_app_directory() {
+        let (_dir, app) = write_app(&[
+            (
+                "package.json",
+                r#"{"dependencies":{"puppeteer":"^24.0.0"},"scripts":{"start":"node server.js"}}"#,
+            ),
+            ("package-lock.json", "{}"),
+            ("server.js", ""),
+        ]);
+        let analysis = plan_for(&app);
+        let expected = format!("{APP_DIR}/.cache/puppeteer");
+        for step in ["install", "build"] {
+            assert_eq!(
+                analysis
+                    .plan
+                    .step(step)
+                    .unwrap()
+                    .variables
+                    .get("PUPPETEER_CACHE_DIR"),
+                Some(&expected),
+                "{step}"
+            );
+        }
+        assert_eq!(
+            analysis.plan.deploy.variables.get("PUPPETEER_CACHE_DIR"),
+            Some(&expected)
+        );
+        // Puppeteer's own postinstall fetches the browser, so adding a
+        // download command would download it a second time.
+        assert!(!analysis
+            .plan
+            .step("install")
+            .unwrap()
+            .commands
+            .iter()
+            .any(|c| c.display_name().contains("playwright install")));
+    }
+
+    #[test]
+    fn an_app_without_a_browser_gets_no_browser_environment() {
+        let (_dir, app) = write_app(&[
+            (
+                "package.json",
+                r#"{"dependencies":{"express":"^4"},"scripts":{"start":"node server.js"}}"#,
+            ),
+            ("package-lock.json", "{}"),
+            ("server.js", ""),
+        ]);
+        let analysis = plan_for(&app);
+        let install = analysis.plan.step("install").unwrap();
+        assert!(install.variables.get("PLAYWRIGHT_BROWSERS_PATH").is_none());
+        assert!(install.variables.get("PUPPETEER_CACHE_DIR").is_none());
+        assert!(!analysis.plan.step("runtime").unwrap().commands[0]
+            .display_name()
+            .contains("libnss3"));
     }
 
     #[test]

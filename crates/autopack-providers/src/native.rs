@@ -71,8 +71,28 @@ pub const NODE: &[NativeDependency] = &[
             "librsvg2-2",
         ],
     },
+    // Puppeteer and Playwright both drive a Chromium build, so both need the
+    // same system libraries. The `-core` variants do not download a browser,
+    // but an app using one still points it at a Chromium that has to run.
     NativeDependency {
         package: "puppeteer",
+        build: &[],
+        runtime: CHROMIUM_RUNTIME,
+    },
+    NativeDependency {
+        package: "puppeteer-core",
+        build: &[],
+        runtime: CHROMIUM_RUNTIME,
+    },
+    // `playwright` also matches `@playwright/test`: the scope and the slash
+    // are both name boundaries. `playwright-core` is not, so it is listed.
+    NativeDependency {
+        package: "playwright",
+        build: &[],
+        runtime: CHROMIUM_RUNTIME,
+    },
+    NativeDependency {
+        package: "playwright-core",
         build: &[],
         runtime: CHROMIUM_RUNTIME,
     },
@@ -239,7 +259,7 @@ pub fn required_packages(manifest: &str, table: &[NativeDependency]) -> (Vec<Str
 /// A substring test would match `psycopg2` inside `psycopg2-binary`, which
 /// bundles its own libpq and needs nothing — and would pull `libpq-dev` into
 /// every build that uses the wheel.
-fn mentions(haystack: &str, needle: &str) -> bool {
+pub(crate) fn mentions(haystack: &str, needle: &str) -> bool {
     haystack.match_indices(needle).any(|(index, _)| {
         let before = haystack[..index].chars().next_back();
         let after = haystack[index + needle.len()..].chars().next();
@@ -289,6 +309,24 @@ mod tests {
         assert!(runtime.contains(&"libcairo2".to_string()));
         // The -dev package must not leak into the runtime image.
         assert!(!runtime.iter().any(|p| p.ends_with("-dev")), "{runtime:?}");
+    }
+
+    #[test]
+    fn playwright_variants_pull_the_chromium_closure() {
+        // `@playwright/test` is the scoped test-runner package most projects
+        // depend on; `-core` is a separate entry because `-` continues a name.
+        for dep in ["playwright", "@playwright/test", "playwright-core"] {
+            let manifest = format!(r#"{{"dependencies":{{"{dep}":"^1.62.0"}}}}"#);
+            let (_, runtime) = required_packages(&manifest, NODE);
+            assert!(runtime.contains(&"libnss3".to_string()), "{dep}");
+            assert!(runtime.contains(&"libgbm1".to_string()), "{dep}");
+        }
+    }
+
+    #[test]
+    fn puppeteer_core_pulls_the_chromium_closure() {
+        let (_, runtime) = required_packages(r#"{"dependencies":{"puppeteer-core":"^24"}}"#, NODE);
+        assert!(runtime.contains(&"libnss3".to_string()));
     }
 
     #[test]
