@@ -32,14 +32,22 @@ fn invokes_bun(package: &PackageJson) -> bool {
 }
 
 /// Major version from a `packageManager` pin such as `pnpm@10.12.0`.
+///
+/// Shares [`normalize_version_range`] with [`PackageManager::mise_tool`] so
+/// range forms (`^10`, `>=10`, `v10.15.0`, `10.x`) agree on the major.
 fn pinned_major(package: &PackageJson, name: &str) -> Option<u32> {
     package
         .package_manager
         .as_deref()
         .filter(|pinned| pinned.starts_with(name))
         .and_then(|pinned| pinned.split_once('@'))
-        .and_then(|(_, version)| version.split('.').next())
-        .and_then(|major| major.parse().ok())
+        .and_then(|(_, version)| normalize_version_range(version))
+        .and_then(|version| {
+            version
+                .split('.')
+                .next()
+                .and_then(|major| major.parse().ok())
+        })
 }
 
 impl PackageManager {
@@ -137,8 +145,10 @@ impl PackageManager {
     ///
     /// For pnpm the command also depends on the pinned major version:
     /// - 11+ (and unpinned latest): `pnpm ci`
-    /// - 10.x: `CI=true pnpm install --frozen-lockfile`
-    /// - older: `pnpm install --frozen-lockfile`
+    /// - earlier with a lockfile: `pnpm install --frozen-lockfile`
+    ///
+    /// `CI=true` is set on the install/build steps separately — do not prefix
+    /// it into this command string.
     pub fn install_command(self, app: &App, package: &PackageJson) -> &'static str {
         match self {
             Self::Npm => {
@@ -151,7 +161,7 @@ impl PackageManager {
             Self::Pnpm => {
                 if app.has_file("pnpm-lock.yaml") {
                     match pinned_major(package, "pnpm") {
-                        Some(major) if major < 11 => "CI=true pnpm install --frozen-lockfile",
+                        Some(major) if major < 11 => "pnpm install --frozen-lockfile",
                         // 11+ and unpinned latest: `pnpm ci` is the durable CI install.
                         _ => "pnpm ci",
                     }
@@ -330,17 +340,20 @@ mod tests {
     }
 
     #[test]
-    fn pnpm_10_sets_ci_for_a_frozen_install() {
-        // pnpm 10 treats CI as the signal for a non-interactive, frozen install.
+    fn pnpm_10_uses_a_frozen_install() {
+        // pnpm 10 has no `ci` subcommand; CI=true is set on the step instead.
         let (_d, app) = app_with(&["package.json", "pnpm-lock.yaml"]);
-        let package = PackageJson {
-            package_manager: Some("pnpm@10.12.0".into()),
-            ..Default::default()
-        };
-        assert_eq!(
-            PackageManager::Pnpm.install_command(&app, &package),
-            "CI=true pnpm install --frozen-lockfile"
-        );
+        for pin in ["pnpm@10.12.0", "pnpm@^10.15.0", "pnpm@>=10", "pnpm@v10.15.0"] {
+            let package = PackageJson {
+                package_manager: Some(pin.into()),
+                ..Default::default()
+            };
+            assert_eq!(
+                PackageManager::Pnpm.install_command(&app, &package),
+                "pnpm install --frozen-lockfile",
+                "{pin}"
+            );
+        }
     }
 
     #[test]
@@ -379,7 +392,7 @@ mod tests {
         };
         assert_eq!(
             PackageManager::Pnpm.install_command(&app, &package),
-            "CI=true pnpm install --frozen-lockfile"
+            "pnpm install --frozen-lockfile"
         );
     }
 
@@ -409,11 +422,24 @@ mod tests {
 
     #[test]
     fn pinned_major_reads_the_major_from_package_manager() {
+        for (pin, major) in [
+            ("pnpm@10.12.0", Some(10)),
+            ("pnpm@^10.15.0", Some(10)),
+            ("pnpm@>=10", Some(10)),
+            ("pnpm@v10.15.0", Some(10)),
+            ("pnpm@10.x", Some(10)),
+            ("pnpm@10", Some(10)),
+        ] {
+            let package = PackageJson {
+                package_manager: Some(pin.into()),
+                ..Default::default()
+            };
+            assert_eq!(pinned_major(&package, "pnpm"), major, "{pin}");
+        }
         let package = PackageJson {
             package_manager: Some("pnpm@10.12.0".into()),
             ..Default::default()
         };
-        assert_eq!(pinned_major(&package, "pnpm"), Some(10));
         assert_eq!(pinned_major(&package, "yarn"), None);
         assert_eq!(pinned_major(&PackageJson::default(), "pnpm"), None);
     }

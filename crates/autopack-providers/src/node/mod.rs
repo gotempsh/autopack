@@ -124,8 +124,12 @@ impl Provider for NodeProvider {
         // pnpm 11+ is distributed as `@pnpm/exe`, a standalone binary that
         // dynamically links libatomic.so.1. debian-slim does not ship it, so
         // without this package `pnpm ci` fails with exit 127 before install.
+        // The runtime stage also copies `/mise` (and puts shims on PATH), so
+        // non-simple start scripts that fall back to `pnpm run start` need the
+        // same library at boot.
         if manager.needs_libatomic(&package) {
             ctx.build_apt_packages.push("libatomic1".to_string());
+            ctx.deploy_apt_packages.push("libatomic1".to_string());
         }
 
         self.plan_install(ctx, &package, manager)?;
@@ -676,6 +680,31 @@ mod tests {
     }
 
     #[test]
+    fn pnpm_11_ships_libatomic_in_the_runtime_image() {
+        // Non-simple start scripts fall back to `pnpm run start`, and the
+        // runtime stage copies `/mise` — so libatomic must be present at boot.
+        let (_dir, app) = write_app(&[
+            (
+                "package.json",
+                r#"{"packageManager":"pnpm@11.19.0","scripts":{"start":"next start -p $PORT"}}"#,
+            ),
+            ("pnpm-lock.yaml", ""),
+            ("index.js", ""),
+        ]);
+        let analysis = plan_for(&app);
+        assert_eq!(
+            analysis.plan.deploy.start_command.as_deref(),
+            Some("pnpm run start")
+        );
+        let runtime = analysis.plan.step("runtime").unwrap();
+        assert!(
+            runtime.commands[0].display_name().contains("libatomic1"),
+            "{}",
+            runtime.commands[0].display_name()
+        );
+    }
+
+    #[test]
     fn older_pnpm_does_not_install_libatomic() {
         let (_dir, app) = write_app(&[
             (
@@ -691,6 +720,12 @@ mod tests {
             !packages.commands[0].display_name().contains("libatomic1"),
             "{}",
             packages.commands[0].display_name()
+        );
+        let runtime = analysis.plan.step("runtime").unwrap();
+        assert!(
+            !runtime.commands[0].display_name().contains("libatomic1"),
+            "{}",
+            runtime.commands[0].display_name()
         );
     }
 
