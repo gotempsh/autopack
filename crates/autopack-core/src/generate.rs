@@ -547,9 +547,10 @@ fn apt_install(packages: &[String]) -> String {
 /// Whether `name` is a legal Debian package name.
 ///
 /// Policy from Debian: lowercase alphanumerics plus `+`, `-`, `.`, at least
-/// two characters, starting alphanumeric. An architecture qualifier (`:any`)
-/// and a version pin (`=1.2.3`) are both accepted because `apt-get install`
-/// takes them.
+/// two characters, starting alphanumeric. Three qualifiers `apt-get install`
+/// accepts are allowed through: an architecture (`libc6:arm64`), a version pin
+/// (`curl=7.88.1-10`), and a release (`foo/bookworm-backports`) — the last of
+/// which is how anyone pulls a package from backports.
 ///
 /// This matters because the list is joined with spaces into a shell command
 /// (see `apt_install`) that runs as root. Nothing in the built-in tables can
@@ -560,6 +561,7 @@ fn apt_install(packages: &[String]) -> String {
 /// beats an apt failure the user has to decode.
 fn is_valid_apt_package(name: &str) -> bool {
     let name = name.split_once('=').map_or(name, |(name, _)| name);
+    let name = name.split_once('/').map_or(name, |(name, _)| name);
     let name = name.split_once(':').map_or(name, |(name, _)| name);
 
     name.len() >= 2
@@ -581,7 +583,7 @@ fn check_apt_packages(packages: &[String]) -> Result<()> {
                 message: format!(
                     "`{package}` is not a valid Debian package name. \
                      Package names are lowercase alphanumerics with `+`, `-` and `.`, \
-                     optionally followed by `:arch` or `=version`."
+                     optionally followed by `:arch`, `=version` or `/release`."
                 ),
             });
         }
@@ -645,6 +647,9 @@ mod tests {
             "libstdc++6",
             "libc6:arm64",
             "curl=7.88.1-10",
+            // How a backported package is requested; rejecting it would break
+            // builds that work today.
+            "foo/bookworm-backports",
         ] {
             assert!(is_valid_apt_package(good), "{good} should be accepted");
         }
