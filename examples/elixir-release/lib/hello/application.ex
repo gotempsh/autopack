@@ -39,4 +39,3 @@ defmodule Hello.Application do
     accept(socket)
   end
 end
-
