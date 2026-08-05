@@ -17,6 +17,11 @@ use crate::support::{
 /// Where a Next.js standalone bundle is staged for the runtime image.
 const STANDALONE_DIR: &str = "/app/standalone";
 
+/// Package Playwright keeps its browsers under, and the directory it uses when
+/// `PLAYWRIGHT_BROWSERS_PATH=0` asks for an install beside the package.
+const PLAYWRIGHT_PACKAGE: &str = "playwright-core";
+const PLAYWRIGHT_BROWSERS: &str = ".local-browsers";
+
 /// Node version used when the app does not pin one.
 const DEFAULT_NODE_VERSION: &str = "24";
 
@@ -154,7 +159,7 @@ impl Provider for NodeProvider {
             // us it wants a pruned server; honouring that is the difference
             // between a 226MB image and a 3.1GB one.
             None if framework == Framework::Next && uses_standalone_output(ctx.app)? => {
-                self.plan_standalone_deploy(ctx)?
+                self.plan_standalone_deploy(ctx, &browsers)?
             }
             None => self.plan_server_deploy(ctx, &package, manager)?,
         }
@@ -277,7 +282,11 @@ impl NodeProvider {
     /// The pieces have to be assembled: Next writes the server to
     /// `.next/standalone`, but leaves `.next/static` and `public/` out of it,
     /// expecting them to be placed alongside.
-    fn plan_standalone_deploy(&self, ctx: &mut BuildContext<'_>) -> Result<()> {
+    fn plan_standalone_deploy(
+        &self,
+        ctx: &mut BuildContext<'_>,
+        browsers: &BrowserTooling,
+    ) -> Result<()> {
         let has_public = ctx.app.has_dir("public");
         let stage = format!(
             "mkdir -p {STANDALONE_DIR} && \
@@ -292,6 +301,19 @@ impl NodeProvider {
         );
 
         ctx.step(steps::BUILD).add_command(Command::shell(stage));
+
+        // Next's tracing follows JS imports, so it carries `playwright-core`
+        // into the bundle but not the browser underneath it, and Puppeteer's
+        // cache sits outside the bundle entirely. Either way the image ends up
+        // advertising browser support — the libraries are installed and the
+        // environment variable is set — while the browser itself is missing,
+        // and the app fails on first use. Carry it across explicitly.
+        for command in browsers.standalone_staging() {
+            ctx.step(steps::BUILD).add_command(Command::shell(command));
+        }
+        for (key, value) in browsers.standalone_variables() {
+            ctx.add_deploy_variable(key, value);
+        }
 
         ctx.add_deploy_input(Layer::step(steps::BUILD).including([STANDALONE_DIR]));
         ctx.add_deploy_variable("NODE_ENV", "production");
@@ -490,6 +512,43 @@ impl BrowserTooling {
     fn is_empty(&self) -> bool {
         self.runtime_packages.is_empty() && self.variables.is_empty()
     }
+
+    fn has(&self, key: &str) -> bool {
+        self.variables.iter().any(|(name, _)| *name == key)
+    }
+
+    /// Commands that copy the browser into the Next.js standalone bundle.
+    fn standalone_staging(&self) -> Vec<String> {
+        let mut commands = Vec::new();
+        if self.has("PLAYWRIGHT_BROWSERS_PATH") {
+            // `-r` not `-a`: the browser tree is plain files, and the deploy
+            // COPY rewrites ownership anyway.
+            commands.push(format!(
+                "mkdir -p {STANDALONE_DIR}/node_modules/{PLAYWRIGHT_PACKAGE} && \
+                 cp -r node_modules/{PLAYWRIGHT_PACKAGE}/{PLAYWRIGHT_BROWSERS} \
+                 {STANDALONE_DIR}/node_modules/{PLAYWRIGHT_PACKAGE}/{PLAYWRIGHT_BROWSERS}"
+            ));
+        }
+        if self.has("PUPPETEER_CACHE_DIR") {
+            commands.push(format!(
+                "mkdir -p {STANDALONE_DIR}/.cache && \
+                 cp -r {APP_DIR}/.cache/puppeteer {STANDALONE_DIR}/.cache/puppeteer"
+            ));
+        }
+        commands
+    }
+
+    /// Environment overrides for the standalone bundle, whose root is not /app.
+    fn standalone_variables(&self) -> Vec<(&'static str, String)> {
+        let mut variables = Vec::new();
+        if self.has("PUPPETEER_CACHE_DIR") {
+            variables.push((
+                "PUPPETEER_CACHE_DIR",
+                format!("{STANDALONE_DIR}/.cache/puppeteer"),
+            ));
+        }
+        variables
+    }
 }
 
 /// Work out how to make a browser available to the app at run time.
@@ -579,6 +638,7 @@ fn is_simple_command(script: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::STANDALONE_DIR;
     use crate::test_support::{plan_for, plan_with_env, write_app};
     use autopack_core::APP_DIR;
 
@@ -848,6 +908,93 @@ mod tests {
             "{:?}",
             packages.assets
         );
+    }
+
+    #[test]
+    fn standalone_output_carries_the_playwright_browser() {
+        // Next traces JS imports, so it pulls playwright-core into the bundle
+        // but leaves the browser underneath it behind. The image then has the
+        // libraries and the environment variable but nothing to launch.
+        let (_dir, app) = write_app(&[
+            (
+                "package.json",
+                r#"{"dependencies":{"next":"^15.1.0","playwright":"^1.62.1"},"scripts":{"build":"next build","start":"next start"}}"#,
+            ),
+            ("package-lock.json", "{}"),
+            (
+                "next.config.js",
+                r#"module.exports = { output: "standalone" };"#,
+            ),
+        ]);
+        let analysis = plan_for(&app);
+        let build = analysis.plan.step("build").unwrap();
+        assert!(
+            build.commands.iter().any(|c| {
+                let name = c.display_name();
+                name.contains(".local-browsers") && name.contains("/app/standalone")
+            }),
+            "{:?}",
+            build
+                .commands
+                .iter()
+                .map(|c| c.display_name())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn standalone_output_repoints_the_puppeteer_cache() {
+        // /app/.cache/puppeteer is outside the bundle, so the variable has to
+        // follow the browser rather than the other way round.
+        let (_dir, app) = write_app(&[
+            (
+                "package.json",
+                r#"{"dependencies":{"next":"^15.1.0","puppeteer":"^24.0.0"},"scripts":{"build":"next build","start":"next start"}}"#,
+            ),
+            ("package-lock.json", "{}"),
+            (
+                "next.config.js",
+                r#"module.exports = { output: "standalone" };"#,
+            ),
+        ]);
+        let analysis = plan_for(&app);
+        assert_eq!(
+            analysis.plan.deploy.variables.get("PUPPETEER_CACHE_DIR"),
+            Some(&format!("{STANDALONE_DIR}/.cache/puppeteer"))
+        );
+        assert!(analysis
+            .plan
+            .step("build")
+            .unwrap()
+            .commands
+            .iter()
+            .any(|c| c
+                .display_name()
+                .contains("/app/standalone/.cache/puppeteer")));
+    }
+
+    #[test]
+    fn standalone_output_without_a_browser_stages_nothing_extra() {
+        let (_dir, app) = write_app(&[
+            (
+                "package.json",
+                r#"{"dependencies":{"next":"^15.1.0"},"scripts":{"build":"next build","start":"next start"}}"#,
+            ),
+            ("package-lock.json", "{}"),
+            (
+                "next.config.js",
+                r#"module.exports = { output: "standalone" };"#,
+            ),
+        ]);
+        let analysis = plan_for(&app);
+        assert!(!analysis
+            .plan
+            .step("build")
+            .unwrap()
+            .commands
+            .iter()
+            .any(|c| c.display_name().contains(".local-browsers")
+                || c.display_name().contains(".cache/puppeteer")));
     }
 
     #[test]
