@@ -53,9 +53,9 @@ than tracking `main`, or a build tool starts changing under you between deploys:
 
 ```toml
 [dependencies]
-autopack-core       = { git = "https://github.com/gotempsh/autopack", tag = "v0.1.0" }
-autopack-providers  = { git = "https://github.com/gotempsh/autopack", tag = "v0.1.0" }
-autopack-dockerfile = { git = "https://github.com/gotempsh/autopack", tag = "v0.1.0" }
+autopack-core       = { git = "https://github.com/gotempsh/autopack", tag = "v0.1.1" }
+autopack-providers  = { git = "https://github.com/gotempsh/autopack", tag = "v0.1.1" }
+autopack-dockerfile = { git = "https://github.com/gotempsh/autopack", tag = "v0.1.1" }
 ```
 
 A host that only needs to *consume* plans — store them, diff them, render them —
@@ -162,7 +162,7 @@ Every tagged release publishes a static binary for Linux (x86_64, aarch64) and
 macOS (Intel, Apple silicon), with a `SHA256SUMS` file alongside them:
 
 ```bash
-VERSION=0.1.0
+VERSION=0.1.1
 TARGET=aarch64-apple-darwin   # or x86_64-unknown-linux-musl, aarch64-unknown-linux-musl, x86_64-apple-darwin
 curl -fsSL "https://github.com/gotempsh/autopack/releases/download/v${VERSION}/autopack-${VERSION}-${TARGET}.tar.gz" \
   | tar -xz --strip-components=1 -C /usr/local/bin "autopack-${VERSION}-${TARGET}/autopack"
