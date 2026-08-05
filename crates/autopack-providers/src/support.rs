@@ -159,6 +159,27 @@ pub fn shell_quote(value: &str) -> String {
 /// Debian release bump — ICU is `libicu72` on bookworm and `libicu76` on
 /// trixie, and the `t64` transition renamed a whole set of others. Asking the
 /// linker and then dpkg is release-agnostic.
+///
+/// Two lookups, because `ldd` answers in two different shapes:
+///
+/// - `libfoo.so.1 => /usr/lib/.../libfoo.so.1` — resolved, so the file is on
+///   disk and `dpkg-query -S` names its owner.
+/// - `libfoo.so.1 => not found` — absent from the build image too, so there is
+///   no path and no file to ask dpkg about. These used to be dropped on the
+///   floor by the `=> /` filter, which meant a genuinely missing library
+///   produced a short list and an image that failed at run time with a loader
+///   error rather than a build that failed with an explanation.
+///
+/// The second shape is resolved with `apt-file`, which maps a filename to the
+/// package providing it without needing the file present. The query is
+/// anchored to the multiarch library directory on purpose: a bare basename
+/// search for `libatomic.so.1` also matches `lib32atomic1` and the
+/// `-cross` packages, and for `libnss3.so` it matches `firefox-esr` and
+/// `thunderbird`, so an unanchored `head -1` installs something wildly wrong.
+///
+/// `apt-file` and its index are only fetched when there is something to look
+/// up — the index is around 90MB, which is not worth paying for on every
+/// build that has nothing missing.
 pub fn record_runtime_libraries(glob: &str, record_to: &str) -> String {
     format!(
         "set -eu; \
@@ -168,6 +189,23 @@ pub fn record_runtime_libraries(glob: &str, record_to: &str) -> String {
            | xargs -r readlink -f 2>/dev/null | sort -u \
            | xargs -r dpkg-query -S 2>/dev/null \
            | cut -d: -f1 | sort -u > {record_to}; \
+         missing=$(ldd {glob} 2>/dev/null | awk '/not found/ {{ print $1 }}' | sort -u); \
+         if [ -n \"$missing\" ]; then \
+           apt-get update >/dev/null; \
+           apt-get install -y --no-install-recommends apt-file >/dev/null; \
+           apt-file update >/dev/null; \
+           for lib in $missing; do \
+             owner=$(apt-file search -x \"^/usr/lib/[a-z0-9_]*-linux-gnu/$lib$\" 2>/dev/null \
+               | cut -d: -f1 | sort -u | head -1); \
+             if [ -n \"$owner\" ]; then \
+               echo \"$owner\" >> {record_to}; \
+             else \
+               echo \"autopack: no package provides $lib\" >&2; \
+               exit 1; \
+             fi; \
+           done; \
+           sort -u -o {record_to} {record_to}; \
+         fi; \
          cat {record_to}"
     )
 }
@@ -201,6 +239,38 @@ mod tests {
         }
         let app = App::new(dir.path()).unwrap();
         (dir, app)
+    }
+
+    #[test]
+    fn missing_libraries_are_resolved_rather_than_dropped() {
+        let script = record_runtime_libraries("/app/bin/app", "/tmp/deps");
+
+        // The resolved branch is unchanged: ldd gives a path, dpkg names the
+        // owner.
+        assert!(script.contains("dpkg-query -S"));
+
+        // The "not found" branch is the point of this: those lines carry no
+        // path, so they used to be filtered out and the library silently
+        // omitted from the runtime image.
+        assert!(script.contains("/not found/"));
+        assert!(script.contains("apt-file search"));
+
+        // Anchored to the multiarch directory. A bare basename search for
+        // libatomic.so.1 also matches lib32atomic1 and the -cross packages,
+        // and libnss3.so matches firefox-esr and thunderbird, so an
+        // unanchored match would install something wildly wrong.
+        assert!(script.contains("^/usr/lib/[a-z0-9_]*-linux-gnu/$lib$"));
+
+        // A library nothing provides fails the build rather than producing a
+        // short list and an image that dies with a loader error.
+        assert!(script.contains("no package provides"));
+        assert!(script.contains("exit 1"));
+
+        // apt-file's index is ~90MB, so it is only fetched when there is
+        // something to look up.
+        let index_fetch = script.find("apt-file update").unwrap();
+        let guard = script.find("if [ -n \"$missing\" ]").unwrap();
+        assert!(guard < index_fetch);
     }
 
     #[test]
