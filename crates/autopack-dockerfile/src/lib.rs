@@ -164,7 +164,13 @@ fn render_command(out: &mut String, command: &Command, mounts: &str, step: &Step
     match command {
         Command::Exec(exec) => {
             if let Some(name) = &exec.custom_name {
-                let _ = writeln!(out, "# {name}");
+                // A newline would end the comment and hand the rest of the
+                // string to the Dockerfile parser as directives — strictly
+                // more powerful than the RUN it labels, since `USER root`, a
+                // fresh `FROM` or a `COPY --from` of an earlier stage all
+                // become available. Display names come from config files, so
+                // they are app-controlled.
+                let _ = writeln!(out, "# {}", one_line(name));
             }
             let _ = writeln!(out, "RUN{mounts} {}", exec.cmd);
         }
@@ -380,8 +386,13 @@ fn mount_flags(plan: &BuildPlan, step: &Step) -> String {
             CacheType::Shared => "shared",
             CacheType::Locked => "locked",
         };
-        // The id keys the cache to this app's directory, so two projects that
-        // both cache `/cache/npm` do not fight over one volume.
+        // The id is derived from the cache name and its mount point, not from
+        // the app: every project on a builder that caches `/cache/npm` shares
+        // one volume. That is deliberate for a content-addressed package
+        // store, which is built to be shared and is most of the value of
+        // caching at all — but it does mean the mount is not a tenant
+        // boundary, so a build that executes untrusted code is writing to a
+        // store other builds read.
         let _ = write!(
             flags,
             " --mount=type=cache,id={id},target={target},sharing={sharing}",
@@ -412,6 +423,11 @@ fn secret_names(plan: &BuildPlan, step: &Step) -> Vec<String> {
         .filter(|name| declared.contains(name))
         .cloned()
         .collect()
+}
+
+/// Collapse a string onto a single line for use inside a `#` comment.
+fn one_line(value: &str) -> String {
+    value.replace(['\n', '\r'], " ").trim_end().to_string()
 }
 
 fn cache_id(name: &str, cache: &Cache) -> String {
@@ -480,6 +496,21 @@ fn json_string(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_newline_in_a_display_name_cannot_inject_a_directive() {
+        // The name is rendered as a `#` comment. A newline would end it and
+        // hand what follows to the Dockerfile parser, which is strictly more
+        // powerful than the RUN it labels — `USER root`, a new `FROM`, or a
+        // `COPY --from` that reads an earlier stage.
+        assert_eq!(
+            one_line("build\nUSER root\nRUN id"),
+            "build USER root RUN id"
+        );
+        assert_eq!(one_line("build\r\nUSER root"), "build  USER root");
+        assert_eq!(one_line("plain name"), "plain name");
+        assert!(!one_line("build\nUSER root").contains('\n'));
+    }
     use super::*;
     use autopack_core::plan::{Deploy, Filter};
     use autopack_core::{analyze, App, Environment};

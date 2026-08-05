@@ -129,7 +129,6 @@ impl Provider for NodeProvider {
         // same library at boot.
         if manager.needs_libatomic(&package, ctx.lock()) {
             ctx.build_apt_packages.push("libatomic1".to_string());
-            ctx.deploy_apt_packages.push("libatomic1".to_string());
         }
 
         // The browser download has to land inside /app to survive into the
@@ -148,6 +147,12 @@ impl Provider for NodeProvider {
         self.plan_build(ctx, &package, manager, &browsers)?;
 
         let static_site = static_site(ctx, &package, framework);
+        // Deferred until the deploy path is known: a static site serves with
+        // Caddy and drops /mise, so it has no pnpm binary to load the library
+        // for. Deciding this up front shipped it into every Vite bundle.
+        if manager.needs_libatomic(&package, ctx.lock()) && static_site.is_none() {
+            ctx.deploy_apt_packages.push("libatomic1".to_string());
+        }
         match &static_site {
             Some(site) => self.plan_static_deploy(ctx, site)?,
             // A Next.js app configured for standalone output has already told
@@ -847,6 +852,32 @@ mod tests {
                 .any(|a| a.contains("pnpm = \"latest\"")),
             "{:?}",
             packages.assets
+        );
+    }
+
+    #[test]
+    fn a_static_site_does_not_ship_libatomic() {
+        // A Vite SPA serves with Caddy and drops /mise, so there is no pnpm
+        // binary in the runtime image to load libatomic for. The build stage
+        // still needs it, because that is where pnpm actually runs.
+        let (_dir, app) = write_app(&[
+            (
+                "package.json",
+                r#"{"packageManager":"pnpm@11.19.0","devDependencies":{"vite":"^5"},"scripts":{"build":"vite build"}}"#,
+            ),
+            ("pnpm-lock.yaml", ""),
+            ("index.html", ""),
+        ]);
+        let analysis = plan_for(&app);
+        assert!(analysis.plan.step("packages").unwrap().commands[0]
+            .display_name()
+            .contains("libatomic1"));
+        assert!(
+            !analysis.plan.step("runtime").unwrap().commands[0]
+                .display_name()
+                .contains("libatomic1"),
+            "{}",
+            analysis.plan.step("runtime").unwrap().commands[0].display_name()
         );
     }
 
