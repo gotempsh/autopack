@@ -168,11 +168,20 @@ pub fn shell_quote(value: &str) -> String {
 ///   a filename to its providing package without needing the file present.
 ///
 /// A soname reaches this from a binary the app produced, so it is untrusted
-/// input. It is validated against the characters a library name can actually
-/// contain before it goes anywhere near the regex: `|` alone would otherwise
-/// escape the path anchor through alternation and let a crafted `DT_NEEDED`
-/// select any package in the archive, which then gets installed as root in the
-/// runtime image.
+/// input, and it is handled twice over.
+///
+/// It is validated against the characters a library name can actually contain,
+/// because `|` would otherwise escape the path anchor through alternation and
+/// let a crafted `DT_NEEDED` select any package in the archive, which then gets
+/// installed as root in the runtime image.
+///
+/// The survivors are then escaped, because two characters a library name
+/// legitimately contains are also regex metacharacters. `+` is a quantifier,
+/// so `libxml++-2.6.so.2` matches nothing and the build fails claiming no
+/// package provides a library that plainly exists — 238 sonames in bookworm
+/// carry a `+`. And `.` matches any character including `/`, so
+/// `gio.modules.libgioremote-volume-monitor.so` reaches `gvfs` two directories
+/// below the anchor. Escaping both collapses the query to the exact basename.
 ///
 /// `apt-file` and its ~90MB index are only fetched when something is actually
 /// missing.
@@ -203,7 +212,8 @@ pub fn record_runtime_libraries(glob: &str, record_to: &str) -> String {
                  echo \"autopack: refusing to look up '$lib': not a library name\" >&2; \
                  exit 1 ;; \
              esac; \
-             owners=$(apt-file search -x \"^/(usr/)?lib/[a-z0-9_]*-linux-gnu[a-z0-9]*/$lib\\$\" \
+             pattern=$(printf '%s' \"$lib\" | sed 's/[.+]/\\\\&/g'); \
+             owners=$(apt-file search -x \"^/(usr/)?lib/[a-z0-9_]*-linux-gnu[a-z0-9]*/$pattern\\$\" \
                | cut -d: -f1 | sort -u); \
              count=$(printf '%s' \"$owners\" | grep -c . || true); \
              if [ \"$count\" -eq 0 ]; then \
@@ -270,6 +280,12 @@ mod tests {
         // the regex — `|` alone escapes the anchor through alternation.
         assert!(script.contains("*[!A-Za-z0-9._+-]*"));
         assert!(script.contains("refusing to look up"));
+
+        // `.` and `+` survive that guard because a library name may contain
+        // them, and both are regex metacharacters — `+` quantifies, so a C++
+        // soname matches nothing, and `.` matches `/`, reaching packages below
+        // the anchored directory.
+        assert!(script.contains("sed 's/[.+]/"));
 
         // Globbing off, so a soname of `*` cannot expand against the build
         // directory; deterministic collation, so the same source does not
