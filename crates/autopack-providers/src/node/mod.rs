@@ -18,9 +18,8 @@ use crate::support::{
 /// Where a Next.js standalone bundle is staged for the runtime image.
 const STANDALONE_DIR: &str = "/app/standalone";
 
-/// Where Playwright keeps browsers when `PLAYWRIGHT_BROWSERS_PATH=0` asks for
-/// an install beside the package.
-const PLAYWRIGHT_PACKAGE: &str = "playwright-core";
+/// Directory Playwright keeps browsers in when `PLAYWRIGHT_BROWSERS_PATH=0`
+/// asks for an install beside the package.
 const PLAYWRIGHT_BROWSERS: &str = ".local-browsers";
 
 /// Fonts a browser needs but never links.
@@ -152,7 +151,7 @@ impl Provider for NodeProvider {
         let browsers = browser_tooling(&package);
         ctx.deploy_apt_packages
             .extend(browsers.runtime_packages.iter().cloned());
-        if !browsers.browser_binaries.is_empty() {
+        if !browsers.browser_searches.is_empty() {
             ctx.add_runtime_input(Layer::step(steps::INSTALL).including([RUNTIME_DEPS_FILE]));
             ctx.add_runtime_command(Command::shell(install_recorded_runtime_libraries(
                 RUNTIME_DEPS_FILE,
@@ -248,9 +247,24 @@ impl NodeProvider {
         // binaries, wrong in both directions — it missed seven libraries apt
         // happened to pull in transitively, and its names are bookworm's, so
         // it breaks on a base image bump.
-        if !browsers.browser_binaries.is_empty() {
+        if !browsers.browser_searches.is_empty() {
+            let search = browsers.browser_searches.join("; ");
+            // Nothing downstream notices an empty result: no binaries means no
+            // libraries recorded, the runtime stage skips its install, and the
+            // image looks fine until the first time it opens a browser. Stop
+            // here, where the message can say what was searched.
+            step.add_command(Command::shell(format!(
+                "set -eu; \
+                 if [ -z \"$({search})\" ]; then \
+                   echo 'autopack: the install step downloaded no browser' >&2; \
+                   echo 'Searched: {search}' >&2; \
+                   echo 'If the download was skipped (PUPPETEER_SKIP_DOWNLOAD, \
+PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD), either unset it or drop the dependency.' >&2; \
+                   exit 1; \
+                 fi"
+            )));
             step.add_command(Command::shell(record_runtime_libraries(
-                &browsers.browser_binaries.join(" "),
+                &format!("$({search})"),
                 RUNTIME_DEPS_FILE,
             )));
         }
@@ -523,8 +537,8 @@ struct BrowserTooling {
     /// are needed, and without them Chromium renders text as empty boxes
     /// instead of failing in a way anyone would notice.
     runtime_packages: Vec<String>,
-    /// Paths to `ldd` for the libraries the browser actually links.
-    browser_binaries: Vec<String>,
+    /// Shell expressions that list the browser binaries to inspect.
+    browser_searches: Vec<String>,
     /// Environment for the install, build and runtime stages.
     variables: Vec<(&'static str, String)>,
     /// Commands the install step runs after dependencies are in place.
@@ -569,7 +583,7 @@ impl BrowserTooling {
 fn browser_tooling(package: &PackageJson) -> BrowserTooling {
     let mut tooling = BrowserTooling {
         runtime_packages: Vec::new(),
-        browser_binaries: Vec::new(),
+        browser_searches: Vec::new(),
         variables: Vec::new(),
         downloads: Vec::new(),
     };
@@ -600,16 +614,27 @@ fn browser_tooling(package: &PackageJson) -> BrowserTooling {
             .variables
             .push(("PUPPETEER_CACHE_DIR", format!("{APP_DIR}/.cache/puppeteer")));
     }
+    // `find` rather than a positional glob. pnpm does not hoist
+    // `playwright-core` to the top of node_modules — the browsers land under
+    // `.pnpm/playwright-core@1.62.1/node_modules/...` — so a glob written for
+    // npm's layout matches nothing there, and matching nothing is silent: the
+    // recorded list comes out empty and the image ships with no browser
+    // libraries at all.
+    //
+    // Both binaries are collected. Playwright launches the headless shell by
+    // default and Puppeteer the full browser, they sit in differently named
+    // directories, and their link sets are not identical.
     if playwright {
-        // Playwright installs beside the package; both the full browser and
-        // the headless shell ship, and they do not link the same set.
-        tooling.browser_binaries.push(format!(
-            "{APP_DIR}/node_modules/{PLAYWRIGHT_PACKAGE}/{PLAYWRIGHT_BROWSERS}/*/chrome-linux*/chrome*"
+        tooling.browser_searches.push(format!(
+            "find {APP_DIR}/node_modules -path '*/{PLAYWRIGHT_BROWSERS}/*' -type f \\
+             \\( -name chrome -o -name chrome-headless-shell -o -name headless_shell \\) \\
+             2>/dev/null"
         ));
     }
     if puppeteer {
-        tooling.browser_binaries.push(format!(
-            "{APP_DIR}/.cache/puppeteer/*/*/chrome-linux*/chrome*"
+        tooling.browser_searches.push(format!(
+            "find {APP_DIR}/.cache/puppeteer -type f \\
+             \\( -name chrome -o -name chrome-headless-shell \\) 2>/dev/null"
         ));
     }
     if playwright || puppeteer {
@@ -1020,9 +1045,10 @@ mod tests {
                 .unwrap()
                 .commands
                 .iter()
-                .any(|c| c.display_name().contains("ldd ")
-                    && c.display_name().contains(".cache/puppeteer")
-                    || c.display_name().contains(PLAYWRIGHT_BROWSERS)),
+                .any(|c| {
+                    c.display_name().contains("ldd ")
+                        && c.display_name().contains(PLAYWRIGHT_BROWSERS)
+                }),
             "install step does not inspect the browser"
         );
 
@@ -1160,6 +1186,68 @@ mod tests {
             .commands
             .iter()
             .any(|c| c.display_name().contains("playwright install")));
+    }
+
+    #[test]
+    fn a_missing_browser_fails_the_build_rather_than_the_container() {
+        // A search that finds nothing is silent: no libraries are recorded,
+        // the runtime stage skips its install, and the image dies the first
+        // time it opens a browser. pnpm hits exactly this — it does not hoist
+        // playwright-core, so a glob written for npm's layout finds nothing.
+        let (_dir, app) = write_app(&[
+            (
+                "package.json",
+                r#"{"dependencies":{"puppeteer":"^24.0.0"},"scripts":{"start":"node s.js"}}"#,
+            ),
+            ("package-lock.json", "{}"),
+            ("s.js", ""),
+        ]);
+        let analysis = plan_for(&app);
+        let install = analysis.plan.step("install").unwrap();
+        let names: Vec<_> = install.commands.iter().map(|c| c.display_name()).collect();
+
+        let guard = names
+            .iter()
+            .position(|n| n.contains("downloaded no browser"))
+            .expect("no guard against a missing browser");
+        assert!(names[guard].contains("exit 1"));
+        assert!(names[guard].contains("SKIP_DOWNLOAD"));
+
+        // The guard has to run before the inspection it protects.
+        let record = names.iter().position(|n| n.contains("ldd ")).unwrap();
+        assert!(guard < record, "{names:?}");
+    }
+
+    #[test]
+    fn browser_discovery_does_not_assume_a_hoisted_layout() {
+        // pnpm puts the browsers under
+        // node_modules/.pnpm/playwright-core@1.62.1/node_modules/... — a
+        // positional glob written for npm finds nothing there, and finding
+        // nothing produced an image with no browser libraries and a build
+        // that exited 0.
+        let (_dir, app) = write_app(&[
+            (
+                "package.json",
+                r#"{"dependencies":{"playwright":"^1.62.1"},"scripts":{"start":"node s.js"}}"#,
+            ),
+            ("pnpm-lock.yaml", ""),
+            ("s.js", ""),
+        ]);
+        let analysis = plan_for(&app);
+        let record = analysis
+            .plan
+            .step("install")
+            .unwrap()
+            .commands
+            .iter()
+            .map(|c| c.display_name())
+            .find(|n| n.contains("ldd "))
+            .expect("no discovery command");
+        assert!(record.contains("find "), "{record}");
+        // Both binaries: Playwright launches the headless shell by default,
+        // Puppeteer the full browser, and they do not link the same set.
+        assert!(record.contains("-name chrome-headless-shell"), "{record}");
+        assert!(record.contains("-name chrome "), "{record}");
     }
 
     #[test]
