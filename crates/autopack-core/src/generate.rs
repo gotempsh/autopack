@@ -312,6 +312,29 @@ impl<'a> BuildContext<'a> {
         self.metadata.insert(key.into(), value.into());
     }
 
+    /// Token that isolates this app's cache mounts, if the operator asked for
+    /// isolation.
+    ///
+    /// Cache mounts are shared by default, and for a content-addressed package
+    /// store that is the point — it is most of the value of caching at all.
+    /// But the mount is not a tenant boundary: install steps run app-controlled
+    /// code as root and hold the store read-write, so on a worker shared
+    /// between projects that are not mutually trusting, one build writes to a
+    /// store the others read. `AUTOPACK_CACHE_SCOPE=app` opts into per-app
+    /// caches for those operators, at the cost of a cold store per project.
+    ///
+    /// The token is a digest of the app's absolute path rather than the path
+    /// itself, which keeps the id short and free of characters the mount
+    /// syntax would object to.
+    fn cache_scope(&self) -> Option<String> {
+        match self.env.config("CACHE_SCOPE")? {
+            "app" => Some(short_digest(&self.app.source().to_string_lossy())),
+            // "shared" is the default; anything else is treated as such rather
+            // than failing a build over a cache setting.
+            _ => None,
+        }
+    }
+
     /// Assemble the final plan: runtime layer, provider steps, runtime image,
     /// user configuration, normalization, and validation.
     pub fn generate(&mut self) -> Result<BuildPlan> {
@@ -345,6 +368,7 @@ impl<'a> BuildContext<'a> {
 
         let mut plan = BuildPlan::new();
         plan.caches = self.caches.clone();
+        plan.cache_scope = self.cache_scope();
 
         let needs_packages_step = !self.packages.is_empty() || !self.build_apt_packages.is_empty();
         if needs_packages_step {
@@ -537,6 +561,20 @@ impl<'a> BuildContext<'a> {
 ///
 /// `apt-get update` and `install` must share one command: splitting them lets
 /// Docker reuse a stale package index and install versions that no longer exist.
+/// A short, stable digest of `value`, for use inside a cache mount id.
+///
+/// FNV-1a rather than `DefaultHasher`, whose output Rust does not promise to
+/// keep stable across releases — a cache id that changed when autopack was
+/// rebuilt would silently discard every cache.
+fn short_digest(value: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x1000_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
 fn apt_install(packages: &[String]) -> String {
     format!(
         "apt-get update && apt-get install -y --no-install-recommends {} && rm -rf /var/lib/apt/lists/*",
@@ -657,6 +695,18 @@ mod tests {
         let err = check_apt_packages(&["libpq5; id".to_string()]).unwrap_err();
         assert!(err.to_string().contains("not a valid Debian package name"));
         assert!(check_apt_packages(&["libpq5".to_string()]).is_ok());
+    }
+
+    #[test]
+    fn cache_scope_is_opt_in_and_stable() {
+        // Default: no token, so every project on a worker shares one store.
+        // That is deliberate — see `cache_scope`.
+        assert_eq!(short_digest("/srv/app-a"), short_digest("/srv/app-a"));
+        assert_ne!(short_digest("/srv/app-a"), short_digest("/srv/app-b"));
+        // Stability matters: a digest that moved between autopack builds
+        // would silently throw away every cache on upgrade.
+        assert_eq!(short_digest("/srv/app-a").len(), 16);
+        assert_eq!(short_digest(""), "cbf29ce484222325");
     }
 
     #[test]

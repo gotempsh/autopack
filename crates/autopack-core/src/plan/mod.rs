@@ -48,6 +48,12 @@ pub struct BuildPlan {
     /// Paths never uploaded into the build context.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exclude: Vec<String>,
+
+    /// Token mixed into every cache mount id, isolating this app's caches
+    /// from other projects built on the same worker. `None` shares them,
+    /// which is the default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_scope: Option<String>,
 }
 
 impl BuildPlan {
