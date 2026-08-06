@@ -10,12 +10,28 @@ use autopack_core::plan::{Command, Layer};
 use autopack_core::{steps, App, BuildContext, Environment, Provider, Result, APP_DIR};
 
 use crate::support::{
-    caddy_layer, caddy_start_command, caddyfile, normalize_version_range, procfile_web_command,
-    read_version_file, CADDYFILE_PATH,
+    caddy_layer, caddy_start_command, caddyfile, install_recorded_runtime_libraries,
+    normalize_version_range, procfile_web_command, read_version_file, record_runtime_libraries,
+    CADDYFILE_PATH, RUNTIME_DEPS_FILE,
 };
 
 /// Where a Next.js standalone bundle is staged for the runtime image.
 const STANDALONE_DIR: &str = "/app/standalone";
+
+/// Where Playwright keeps browsers when `PLAYWRIGHT_BROWSERS_PATH=0` asks for
+/// an install beside the package.
+const PLAYWRIGHT_PACKAGE: &str = "playwright-core";
+const PLAYWRIGHT_BROWSERS: &str = ".local-browsers";
+
+/// Fonts a browser needs but never links.
+///
+/// Everything else Chromium requires is a `DT_NEEDED` entry, so `ldd` finds it
+/// — measured against Chrome for Testing: with the discovered set installed
+/// there are zero unresolved libraries and it renders, screenshots and prints.
+/// Fonts are the exception. They are opened through fontconfig at run time, so
+/// no amount of inspecting the binary reveals them, and a browser without them
+/// draws text as empty boxes rather than failing in a way anyone would notice.
+const CHROMIUM_FONTS: &[&str] = &["fonts-liberation"];
 
 /// Node version used when the app does not pin one.
 const DEFAULT_NODE_VERSION: &str = "24";
@@ -136,6 +152,12 @@ impl Provider for NodeProvider {
         let browsers = browser_tooling(&package);
         ctx.deploy_apt_packages
             .extend(browsers.runtime_packages.iter().cloned());
+        if !browsers.browser_binaries.is_empty() {
+            ctx.add_runtime_input(Layer::step(steps::INSTALL).including([RUNTIME_DEPS_FILE]));
+            ctx.add_runtime_command(Command::shell(install_recorded_runtime_libraries(
+                RUNTIME_DEPS_FILE,
+            )));
+        }
         if !browsers.is_empty() {
             ctx.add_metadata("browser", "chromium");
         }
@@ -220,6 +242,17 @@ impl NodeProvider {
         step.add_command(Command::shell(install_command));
         for download in &browsers.downloads {
             step.add_command(Command::shell(download.clone()));
+        }
+        // Ask the browser what it links rather than carrying a list. The
+        // hardcoded closure was a hand-maintained union across two Chrome
+        // binaries, wrong in both directions — it missed seven libraries apt
+        // happened to pull in transitively, and its names are bookworm's, so
+        // it breaks on a base image bump.
+        if !browsers.browser_binaries.is_empty() {
+            step.add_command(Command::shell(record_runtime_libraries(
+                &browsers.browser_binaries.join(" "),
+                RUNTIME_DEPS_FILE,
+            )));
         }
         Ok(())
     }
@@ -483,8 +516,15 @@ fn node_version(app: &App, package: &PackageJson) -> Result<(String, String)> {
 /// Browser tooling an app needs wired up: the system libraries the browser
 /// links against, where it is cached, and how it is fetched.
 struct BrowserTooling {
-    /// Debian packages the runtime image needs.
+    /// Debian packages the runtime image needs that `ldd` cannot discover.
+    ///
+    /// Fonts only. A browser does not link them — it opens them through
+    /// fontconfig at run time — so nothing about the binary reveals that they
+    /// are needed, and without them Chromium renders text as empty boxes
+    /// instead of failing in a way anyone would notice.
     runtime_packages: Vec<String>,
+    /// Paths to `ldd` for the libraries the browser actually links.
+    browser_binaries: Vec<String>,
     /// Environment for the install, build and runtime stages.
     variables: Vec<(&'static str, String)>,
     /// Commands the install step runs after dependencies are in place.
@@ -529,6 +569,7 @@ impl BrowserTooling {
 fn browser_tooling(package: &PackageJson) -> BrowserTooling {
     let mut tooling = BrowserTooling {
         runtime_packages: Vec::new(),
+        browser_binaries: Vec::new(),
         variables: Vec::new(),
         downloads: Vec::new(),
     };
@@ -559,8 +600,20 @@ fn browser_tooling(package: &PackageJson) -> BrowserTooling {
             .variables
             .push(("PUPPETEER_CACHE_DIR", format!("{APP_DIR}/.cache/puppeteer")));
     }
+    if playwright {
+        // Playwright installs beside the package; both the full browser and
+        // the headless shell ship, and they do not link the same set.
+        tooling.browser_binaries.push(format!(
+            "{APP_DIR}/node_modules/{PLAYWRIGHT_PACKAGE}/{PLAYWRIGHT_BROWSERS}/*/chrome-linux*/chrome*"
+        ));
+    }
+    if puppeteer {
+        tooling.browser_binaries.push(format!(
+            "{APP_DIR}/.cache/puppeteer/*/*/chrome-linux*/chrome*"
+        ));
+    }
     if playwright || puppeteer {
-        tooling.runtime_packages = crate::native::CHROMIUM_RUNTIME
+        tooling.runtime_packages = CHROMIUM_FONTS
             .iter()
             .map(|package| (*package).to_string())
             .collect();
@@ -584,6 +637,7 @@ fn is_simple_command(script: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::{PLAYWRIGHT_BROWSERS, RUNTIME_DEPS_FILE};
     use crate::test_support::{plan_for, plan_with_env, write_app};
     use autopack_core::APP_DIR;
 
@@ -930,7 +984,7 @@ mod tests {
     }
 
     #[test]
-    fn playwright_gets_the_chromium_libraries_and_an_in_app_browser_cache() {
+    fn playwright_discovers_its_libraries_and_gets_an_in_app_browser_cache() {
         // The browser is downloaded during install. Left at its default
         // location it lands under $HOME, which the deploy layer never carries
         // — and the build runs as root while the runtime user is `autopack`,
@@ -945,11 +999,31 @@ mod tests {
         ]);
         let analysis = plan_for(&app);
 
+        // No hardcoded library closure: the runtime image installs whatever
+        // `ldd` found the browser to link, plus fonts, which are opened
+        // through fontconfig and so are invisible to the linker.
         let runtime = analysis.plan.step("runtime").unwrap();
+        let apt = runtime.commands[0].display_name();
+        assert!(apt.contains("fonts-liberation"), "{apt}");
+        assert!(!apt.contains("libnss3"), "{apt}");
         assert!(
-            runtime.commands[0].display_name().contains("libnss3"),
-            "{}",
-            runtime.commands[0].display_name()
+            runtime
+                .commands
+                .iter()
+                .any(|c| c.display_name().contains(RUNTIME_DEPS_FILE)),
+            "runtime does not install the recorded libraries"
+        );
+        assert!(
+            analysis
+                .plan
+                .step("install")
+                .unwrap()
+                .commands
+                .iter()
+                .any(|c| c.display_name().contains("ldd ")
+                    && c.display_name().contains(".cache/puppeteer")
+                    || c.display_name().contains(PLAYWRIGHT_BROWSERS)),
+            "install step does not inspect the browser"
         );
 
         for step in ["install", "build"] {
@@ -1057,7 +1131,7 @@ mod tests {
             assert!(
                 !analysis.plan.step("runtime").unwrap().commands[0]
                     .display_name()
-                    .contains("libnss3"),
+                    .contains("fonts-liberation"),
                 "{manifest}"
             );
         }
@@ -1077,9 +1151,8 @@ mod tests {
             ("index.html", ""),
         ]);
         let analysis = plan_for(&app);
-        assert!(!analysis.plan.step("runtime").unwrap().commands[0]
-            .display_name()
-            .contains("libnss3"));
+        let apt = analysis.plan.step("runtime").unwrap().commands[0].display_name();
+        assert!(!apt.contains("fonts-liberation"), "{apt}");
         assert!(!analysis
             .plan
             .step("install")
@@ -1103,9 +1176,8 @@ mod tests {
         let install = analysis.plan.step("install").unwrap();
         assert!(install.variables.get("PLAYWRIGHT_BROWSERS_PATH").is_none());
         assert!(install.variables.get("PUPPETEER_CACHE_DIR").is_none());
-        assert!(!analysis.plan.step("runtime").unwrap().commands[0]
-            .display_name()
-            .contains("libnss3"));
+        let apt = analysis.plan.step("runtime").unwrap().commands[0].display_name();
+        assert!(!apt.contains("fonts-liberation"), "{apt}");
     }
 
     #[test]
