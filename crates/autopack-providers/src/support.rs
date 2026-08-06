@@ -176,9 +176,14 @@ pub fn shell_quote(value: &str) -> String {
 ///
 /// `apt-file` and its ~90MB index are only fetched when something is actually
 /// missing.
+///
+/// `glob` is expanded by the shell, so it may name several binaries — pathname
+/// expansion stays on for that line and is turned off only around the loop
+/// over sonames, where a `*` from a crafted `DT_NEEDED` would otherwise expand
+/// against the build directory.
 pub fn record_runtime_libraries(glob: &str, record_to: &str) -> String {
     format!(
-        "set -euf; \
+        "set -eu; \
          export LC_ALL=C; \
          mkdir -p \"$(dirname {record_to})\"; \
          ldd {glob} 2>/dev/null \
@@ -191,6 +196,7 @@ pub fn record_runtime_libraries(glob: &str, record_to: &str) -> String {
            apt-get update >/dev/null; \
            apt-get install -y --no-install-recommends apt-file >/dev/null; \
            apt-file update >/dev/null; \
+           set -f; \
            for lib in $missing; do \
              case \"$lib\" in \
                *[!A-Za-z0-9._+-]*) \
@@ -268,7 +274,12 @@ mod tests {
         // Globbing off, so a soname of `*` cannot expand against the build
         // directory; deterministic collation, so the same source does not
         // resolve differently on two builders.
-        assert!(script.contains("set -euf"));
+        assert!(script.contains("set -eu"));
+        // Globbing is off for the soname loop but must stay on for `ldd`,
+        // whose argument is a glob for callers that inspect several binaries.
+        let ldd = script.find("ldd ").unwrap();
+        let disable = script.find("set -f;").unwrap();
+        assert!(ldd < disable);
         assert!(script.contains("LC_ALL=C"));
 
         // The anchor covers /lib as well as /usr/lib: on Debian the essential
