@@ -151,38 +151,35 @@ pub fn shell_quote(value: &str) -> String {
 
 /// Record which Debian packages own the shared libraries `glob` links against.
 ///
-/// Runs in the build stage, where the `-dev` packages are still installed:
-/// `ldd` reports a missing library as "not found" with no path, so the lookup
-/// cannot be deferred to the runtime image.
+/// Runs in the build stage, where the `-dev` packages are still installed.
 ///
 /// This exists because hardcoding runtime package names does not survive a
 /// Debian release bump — ICU is `libicu72` on bookworm and `libicu76` on
 /// trixie, and the `t64` transition renamed a whole set of others. Asking the
-/// linker and then dpkg is release-agnostic.
+/// linker and then dpkg is release-agnostic, and it installs exactly what the
+/// binary links rather than a hand-maintained superset.
 ///
-/// Two lookups, because `ldd` answers in two different shapes:
+/// `ldd` answers in two shapes, and both matter:
 ///
 /// - `libfoo.so.1 => /usr/lib/.../libfoo.so.1` — resolved, so the file is on
 ///   disk and `dpkg-query -S` names its owner.
 /// - `libfoo.so.1 => not found` — absent from the build image too, so there is
-///   no path and no file to ask dpkg about. These used to be dropped on the
-///   floor by the `=> /` filter, which meant a genuinely missing library
-///   produced a short list and an image that failed at run time with a loader
-///   error rather than a build that failed with an explanation.
+///   no path to ask dpkg about. These are resolved with `apt-file`, which maps
+///   a filename to its providing package without needing the file present.
 ///
-/// The second shape is resolved with `apt-file`, which maps a filename to the
-/// package providing it without needing the file present. The query is
-/// anchored to the multiarch library directory on purpose: a bare basename
-/// search for `libatomic.so.1` also matches `lib32atomic1` and the
-/// `-cross` packages, and for `libnss3.so` it matches `firefox-esr` and
-/// `thunderbird`, so an unanchored `head -1` installs something wildly wrong.
+/// A soname reaches this from a binary the app produced, so it is untrusted
+/// input. It is validated against the characters a library name can actually
+/// contain before it goes anywhere near the regex: `|` alone would otherwise
+/// escape the path anchor through alternation and let a crafted `DT_NEEDED`
+/// select any package in the archive, which then gets installed as root in the
+/// runtime image.
 ///
-/// `apt-file` and its index are only fetched when there is something to look
-/// up — the index is around 90MB, which is not worth paying for on every
-/// build that has nothing missing.
+/// `apt-file` and its ~90MB index are only fetched when something is actually
+/// missing.
 pub fn record_runtime_libraries(glob: &str, record_to: &str) -> String {
     format!(
-        "set -eu; \
+        "set -euf; \
+         export LC_ALL=C; \
          mkdir -p \"$(dirname {record_to})\"; \
          ldd {glob} 2>/dev/null \
            | awk '/=> \\// {{ print $3 }}' | sort -u \
@@ -195,14 +192,25 @@ pub fn record_runtime_libraries(glob: &str, record_to: &str) -> String {
            apt-get install -y --no-install-recommends apt-file >/dev/null; \
            apt-file update >/dev/null; \
            for lib in $missing; do \
-             owner=$(apt-file search -x \"^/usr/lib/[a-z0-9_]*-linux-gnu/$lib$\" 2>/dev/null \
-               | cut -d: -f1 | sort -u | head -1); \
-             if [ -n \"$owner\" ]; then \
-               echo \"$owner\" >> {record_to}; \
-             else \
+             case \"$lib\" in \
+               *[!A-Za-z0-9._+-]*) \
+                 echo \"autopack: refusing to look up '$lib': not a library name\" >&2; \
+                 exit 1 ;; \
+             esac; \
+             owners=$(apt-file search -x \"^/(usr/)?lib/[a-z0-9_]*-linux-gnu[a-z0-9]*/$lib\\$\" \
+               | cut -d: -f1 | sort -u); \
+             count=$(printf '%s' \"$owners\" | grep -c . || true); \
+             if [ \"$count\" -eq 0 ]; then \
                echo \"autopack: no package provides $lib\" >&2; \
                exit 1; \
              fi; \
+             if [ \"$count\" -gt 1 ]; then \
+               echo \"autopack: $lib is provided by more than one package:\" >&2; \
+               printf '  %s\\n' $owners >&2; \
+               echo \"Choose one and add it to apt_packages in autopack.json.\" >&2; \
+               exit 1; \
+             fi; \
+             printf '%s\\n' \"$owners\" >> {record_to}; \
            done; \
            sort -u -o {record_to} {record_to}; \
          fi; \
@@ -242,35 +250,41 @@ mod tests {
     }
 
     #[test]
-    fn missing_libraries_are_resolved_rather_than_dropped() {
+    fn missing_libraries_are_resolved_and_hostile_sonames_refused() {
         let script = record_runtime_libraries("/app/bin/app", "/tmp/deps");
 
-        // The resolved branch is unchanged: ldd gives a path, dpkg names the
-        // owner.
+        // Resolved libraries: unchanged path through dpkg.
         assert!(script.contains("dpkg-query -S"));
-
-        // The "not found" branch is the point of this: those lines carry no
-        // path, so they used to be filtered out and the library silently
-        // omitted from the runtime image.
+        // Missing ones are looked up rather than dropped on the floor.
         assert!(script.contains("/not found/"));
         assert!(script.contains("apt-file search"));
 
-        // Anchored to the multiarch directory. A bare basename search for
-        // libatomic.so.1 also matches lib32atomic1 and the -cross packages,
-        // and libnss3.so matches firefox-esr and thunderbird, so an
-        // unanchored match would install something wildly wrong.
-        assert!(script.contains("^/usr/lib/[a-z0-9_]*-linux-gnu/$lib$"));
+        // A soname comes from a binary the app produced. Anything outside the
+        // character set a library name can hold is refused before it reaches
+        // the regex — `|` alone escapes the anchor through alternation.
+        assert!(script.contains("*[!A-Za-z0-9._+-]*"));
+        assert!(script.contains("refusing to look up"));
 
-        // A library nothing provides fails the build rather than producing a
-        // short list and an image that dies with a loader error.
+        // Globbing off, so a soname of `*` cannot expand against the build
+        // directory; deterministic collation, so the same source does not
+        // resolve differently on two builders.
+        assert!(script.contains("set -euf"));
+        assert!(script.contains("LC_ALL=C"));
+
+        // The anchor covers /lib as well as /usr/lib: on Debian the essential
+        // libraries are still recorded unmerged, so a /usr-only anchor fails
+        // the build for libc, libz and friends.
+        assert!(script.contains("^/(usr/)?lib/[a-z0-9_]*-linux-gnu[a-z0-9]*/"));
+
+        // Ambiguity and absence both stop the build with something actionable
+        // rather than guessing.
         assert!(script.contains("no package provides"));
-        assert!(script.contains("exit 1"));
+        assert!(script.contains("provided by more than one package"));
+        assert!(script.contains("add it to apt_packages"));
 
-        // apt-file's index is ~90MB, so it is only fetched when there is
-        // something to look up.
-        let index_fetch = script.find("apt-file update").unwrap();
+        // The ~90MB index is only fetched when there is something to look up.
         let guard = script.find("if [ -n \"$missing\" ]").unwrap();
-        assert!(guard < index_fetch);
+        assert!(guard < script.find("apt-file update").unwrap());
     }
 
     #[test]
