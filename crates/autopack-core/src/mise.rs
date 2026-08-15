@@ -57,7 +57,10 @@ pub fn installer_command(version: &str) -> String {
               --connect-timeout 20 --max-time 120 \
               --output \"$mise_tmp/install.sh.sig\" {signature_url} \
          && gpg --homedir \"$mise_tmp/gnupg\" --batch \
-              --decrypt \"$mise_tmp/install.sh.sig\" > \"$mise_tmp/install.sh\" \
+              --status-fd 3 --decrypt \"$mise_tmp/install.sh.sig\" \
+              3> \"$mise_tmp/gpg-status\" > \"$mise_tmp/install.sh\" \
+         && grep -Fq '[GNUPG:] VALIDSIG {MISE_RELEASE_KEY_FINGERPRINT} ' \
+              \"$mise_tmp/gpg-status\" \
          && MISE_VERSION={quoted_version} sh \"$mise_tmp/install.sh\""
     )
 }
@@ -181,6 +184,9 @@ mod tests {
         assert!(command.contains("install.sh.sig"));
         assert!(!command.contains("https://mise.run |"));
         assert!(command.contains(MISE_RELEASE_KEY_FINGERPRINT));
+        assert!(command.contains(&format!(
+            "[GNUPG:] VALIDSIG {MISE_RELEASE_KEY_FINGERPRINT} "
+        )));
         assert!(command.contains("MISE_VERSION='v2026.7.18' sh \"$mise_tmp/install.sh\""));
         assert!(command.contains("mise_tmp=$(mktemp -d)"));
         assert!(command.contains("trap 'rm -rf \"$mise_tmp\"' EXIT HUP INT TERM"));
