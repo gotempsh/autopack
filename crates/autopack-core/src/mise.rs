@@ -20,6 +20,59 @@ pub const MISE_DIR: &str = "/mise";
 /// Directory added to `PATH` so installed tools are callable.
 pub const MISE_SHIMS: &str = "/mise/shims";
 
+/// Full fingerprint of the release key documented by mise.
+const MISE_RELEASE_KEY_FINGERPRINT: &str = "24853EC9F655CE80B48E6C3A8B81C9D17413A06D";
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+/// Shell command that downloads and runs the pinned mise installer.
+///
+/// The signed, versioned release asset is verified against mise's pinned
+/// release-key fingerprint before execution. Temporary files are private and
+/// removed on success, failure, or interruption.
+pub fn installer_command(version: &str) -> String {
+    let quoted_version = shell_quote(version);
+    let signature_url = shell_quote(&format!(
+        "https://github.com/jdx/mise/releases/download/{version}/install.sh.sig"
+    ));
+    format!(
+        "mise_tmp=$(mktemp -d) \
+         && chmod 700 \"$mise_tmp\" \
+         && trap 'rm -rf \"$mise_tmp\"' EXIT HUP INT TERM \
+         && mkdir -m 700 \"$mise_tmp/gnupg\" \
+         && curl --fail --silent --show-error --location \
+              --retry 5 --retry-all-errors --retry-delay 2 \
+              --connect-timeout 20 --max-time 120 \
+              --output \"$mise_tmp/key.asc\" https://mise.jdx.dev/gpg-key.pub \
+         && test \"$(gpg --homedir \"$mise_tmp/gnupg\" --batch --with-colons \
+              --show-keys \"$mise_tmp/key.asc\" \
+              | awk -F: '$1 == \"fpr\" {{ print $10; exit }}')\" = \
+              '{MISE_RELEASE_KEY_FINGERPRINT}' \
+         && gpg --homedir \"$mise_tmp/gnupg\" --batch \
+              --import \"$mise_tmp/key.asc\" >/dev/null 2>&1 \
+         && curl --fail --silent --show-error --location \
+              --retry 5 --retry-all-errors --retry-delay 2 \
+              --connect-timeout 20 --max-time 120 \
+              --output \"$mise_tmp/install.sh.sig\" {signature_url} \
+         && gpg --homedir \"$mise_tmp/gnupg\" --batch \
+              --status-fd 3 --decrypt \"$mise_tmp/install.sh.sig\" \
+              3> \"$mise_tmp/gpg-status\" > \"$mise_tmp/install.sh\" \
+         && grep -Fq '[GNUPG:] VALIDSIG {MISE_RELEASE_KEY_FINGERPRINT} ' \
+              \"$mise_tmp/gpg-status\" \
+         && MISE_VERSION={quoted_version} sh \"$mise_tmp/install.sh\""
+    )
+}
+
+/// Command used by `autopack lock` to resolve one tool specification.
+pub fn latest_command(tool: &str, version: &str) -> String {
+    format!(
+        "/usr/local/bin/mise latest {}",
+        shell_quote(&format!("{tool}@{version}"))
+    )
+}
+
 /// A runtime a provider asked for, and why.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackageRequest {
@@ -120,5 +173,39 @@ mod tests {
         let (_, request) = packages.iter().next().unwrap();
         assert_eq!(request.version, "22");
         assert_eq!(request.source, ".nvmrc");
+    }
+
+    #[test]
+    fn installer_download_retries_without_piping_partial_content_to_shell() {
+        let command = installer_command("v2026.7.18");
+
+        assert!(command.contains("--retry 5 --retry-all-errors"));
+        assert!(command.contains("--connect-timeout 20 --max-time 120"));
+        assert!(command.contains("install.sh.sig"));
+        assert!(!command.contains("https://mise.run |"));
+        assert!(command.contains(MISE_RELEASE_KEY_FINGERPRINT));
+        assert!(command.contains(&format!(
+            "[GNUPG:] VALIDSIG {MISE_RELEASE_KEY_FINGERPRINT} "
+        )));
+        assert!(command.contains("MISE_VERSION='v2026.7.18' sh \"$mise_tmp/install.sh\""));
+        assert!(command.contains("mise_tmp=$(mktemp -d)"));
+        assert!(command.contains("trap 'rm -rf \"$mise_tmp\"' EXIT HUP INT TERM"));
+    }
+
+    #[test]
+    fn installer_version_is_shell_quoted() {
+        let command = installer_command("v1'; touch /tmp/pwned; '");
+
+        assert!(command.contains("MISE_VERSION='v1'\"'\"'; touch /tmp/pwned; '\"'\"''"));
+        assert!(command
+            .contains("releases/download/v1'\"'\"'; touch /tmp/pwned; '\"'\"'/install.sh.sig'"));
+    }
+
+    #[test]
+    fn latest_tool_spec_is_shell_quoted() {
+        assert_eq!(
+            latest_command("node; touch /tmp/pwned", "22' && id"),
+            "/usr/local/bin/mise latest 'node; touch /tmp/pwned@22'\"'\"' && id'"
+        );
     }
 }

@@ -42,6 +42,19 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+      - name: Conformance failure reporting
+        shell: bash
+        run: |
+          failure_log=$(mktemp)
+          trap 'rm -f "$failure_log"' EXIT
+          if AUTOPACK=/usr/bin/false ./scripts/conformance.sh node-express >"$failure_log" 2>&1; then
+            echo "expected the forced conformance build to fail" >&2
+            exit 1
+          fi
+          cat "$failure_log"
+          ! grep -q "unbound variable" "$failure_log"
+          grep -q "node-express: build — see log" "$failure_log"
+
   conformance:
     name: Conformance
     runs-on: ubuntu-latest

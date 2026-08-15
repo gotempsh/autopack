@@ -24,7 +24,7 @@ pub const APP_DIR: &str = "/app";
 pub const DEFAULT_BASE_IMAGE: &str = "debian:bookworm-slim";
 
 /// Packages installed in every builder image, needed to bootstrap mise.
-const BOOTSTRAP_APT_PACKAGES: &[&str] = &["ca-certificates", "curl", "git"];
+const BOOTSTRAP_APT_PACKAGES: &[&str] = &["ca-certificates", "curl", "git", "gnupg"];
 
 /// Packages installed in every runtime image.
 ///
@@ -448,9 +448,7 @@ impl<'a> BuildContext<'a> {
             .env
             .config("MISE_VERSION")
             .unwrap_or(mise::DEFAULT_MISE_VERSION);
-        step.add_command(Command::shell(format!(
-            "curl -fsSL https://mise.run | MISE_VERSION={mise_version} sh"
-        )));
+        step.add_command(Command::shell(mise::installer_command(mise_version)));
 
         // Exact versions from the lock replace the fuzzy specification, so
         // `node = "22"` becomes `node = "22.14.0"` and stops drifting.

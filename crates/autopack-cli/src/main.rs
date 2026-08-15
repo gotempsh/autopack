@@ -195,7 +195,7 @@ fn write_lock(common: &CommonArgs, analysis: &Analysis, update: bool) -> Result<
             continue;
         }
         eprintln!("resolving {tool}@{}...", request.version);
-        let exact = resolve_tool_version(tool, &request.version)?;
+        let exact = resolve_tool_version(tool, &request.version, &analysis.mise_version)?;
         lock.set_tool(tool, exact);
     }
 
@@ -244,16 +244,17 @@ fn plan_images(plan: &autopack_core::BuildPlan) -> Vec<String> {
 }
 
 /// Ask mise which exact version a specification resolves to.
-fn resolve_tool_version(tool: &str, version: &str) -> Result<String> {
+fn resolve_tool_version(tool: &str, version: &str, mise_version: &str) -> Result<String> {
+    let latest = autopack_core::mise::latest_command(tool, version);
     let script = format!(
         // The slim base has no curl, and resolution must use the same mise
         // release the build will use — otherwise the lock records a version
         // the build would not have chosen.
         "set -e; apt-get update >/dev/null 2>&1; \
          apt-get install -y --no-install-recommends ca-certificates curl >/dev/null 2>&1; \
-         curl -fsSL https://mise.run | MISE_VERSION={mise} sh >/dev/null 2>&1; \
-         /usr/local/bin/mise latest {tool}@{version}",
-        mise = autopack_core::mise::DEFAULT_MISE_VERSION,
+         ({installer}) >/dev/null 2>&1; \
+         {latest}",
+        installer = autopack_core::mise::installer_command(mise_version),
     );
 
     let output = ProcessCommand::new("docker")

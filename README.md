@@ -192,8 +192,8 @@ Detected:
   mainPackage    .
 Steps:
   packages
-    $ apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git && rm -rf /var/lib/apt/lists/*
-    $ curl -fsSL https://mise.run | MISE_VERSION=v2026.7.18 sh
+    $ apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git gnupg && rm -rf /var/lib/apt/lists/*
+    $ download and verify the signed mise v2026.7.18 installer, then run it
     $ create /mise/config.toml
     $ mise install && mise reshim
     $ PATH += /mise/shims
