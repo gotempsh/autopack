@@ -205,6 +205,14 @@ pub fn record_runtime_libraries(binary: &str, record_to: &str) -> String {
                echo \"autopack: refusing to look up '$lib': not a library name\" >&2; \
                exit 1 ;; \
            esac; \
+         done; \
+         set +f; \
+         for lib in $needed; do \
+           case \"$lib\" in \
+             ''|*[!A-Za-z0-9._+-]*) \
+               echo \"autopack: refusing to look up '$lib': not a library name\" >&2; \
+               exit 1 ;; \
+           esac; \
            owners=$(for path in /lib/\"$lib\" /usr/lib/\"$lib\" \
              /lib/*-linux-gnu*/\"$lib\" /usr/lib/*-linux-gnu*/\"$lib\"; do \
                if [ -e \"$path\" ]; then readlink -f \"$path\"; fi; \
@@ -311,12 +319,13 @@ mod tests {
         // the anchored directory.
         assert!(script.contains("sed 's/[.+]/"));
 
-        // Globbing off, so a hostile soname cannot expand against the build
-        // directory; deterministic collation keeps owner selection stable.
+        // Globbing is disabled while untrusted sonames are validated, then
+        // restored so direct multiarch loader-directory patterns expand.
         assert!(script.contains("set -eu"));
-        let readelf = script.find("readelf ").unwrap();
         let disable = script.find("set -f;").unwrap();
-        assert!(readelf < disable);
+        let enable = script.find("set +f;").unwrap();
+        let loader_glob = script.find("/lib/*-linux-gnu*/").unwrap();
+        assert!(disable < enable && enable < loader_glob);
         assert!(script.contains("LC_ALL=C"));
 
         // The anchor covers /lib as well as /usr/lib: on Debian the essential
