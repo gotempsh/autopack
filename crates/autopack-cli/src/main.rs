@@ -251,9 +251,10 @@ fn resolve_tool_version(tool: &str, version: &str) -> Result<String> {
         // the build would not have chosen.
         "set -e; apt-get update >/dev/null 2>&1; \
          apt-get install -y --no-install-recommends ca-certificates curl >/dev/null 2>&1; \
-         curl -fsSL https://mise.run | MISE_VERSION={mise} sh >/dev/null 2>&1; \
+         ({installer}) >/dev/null 2>&1; \
          /usr/local/bin/mise latest {tool}@{version}",
-        mise = autopack_core::mise::DEFAULT_MISE_VERSION,
+        installer =
+            autopack_core::mise::installer_command(autopack_core::mise::DEFAULT_MISE_VERSION),
     );
 
     let output = ProcessCommand::new("docker")

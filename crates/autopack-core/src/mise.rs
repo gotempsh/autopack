@@ -20,6 +20,21 @@ pub const MISE_DIR: &str = "/mise";
 /// Directory added to `PATH` so installed tools are callable.
 pub const MISE_SHIMS: &str = "/mise/shims";
 
+/// Shell command that downloads and runs the pinned mise installer.
+///
+/// Download to a file instead of piping into `sh`: curl can then retry a
+/// connection reset without feeding a partial installer to the shell.
+pub fn installer_command(version: &str) -> String {
+    let quoted_version = format!("'{}'", version.replace('\'', "'\"'\"'"));
+    format!(
+        "curl --fail --silent --show-error --location \
+         --retry 5 --retry-all-errors --retry-delay 2 \
+         --output /tmp/mise-install.sh https://mise.run \
+         && MISE_VERSION={quoted_version} sh /tmp/mise-install.sh \
+         && rm -f /tmp/mise-install.sh"
+    )
+}
+
 /// A runtime a provider asked for, and why.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackageRequest {
@@ -120,5 +135,22 @@ mod tests {
         let (_, request) = packages.iter().next().unwrap();
         assert_eq!(request.version, "22");
         assert_eq!(request.source, ".nvmrc");
+    }
+
+    #[test]
+    fn installer_download_retries_without_piping_partial_content_to_shell() {
+        let command = installer_command("v2026.7.18");
+
+        assert!(command.contains("--retry 5 --retry-all-errors"));
+        assert!(command.contains("--output /tmp/mise-install.sh"));
+        assert!(!command.contains("https://mise.run |"));
+        assert!(command.contains("MISE_VERSION='v2026.7.18' sh /tmp/mise-install.sh"));
+    }
+
+    #[test]
+    fn installer_version_is_shell_quoted() {
+        let command = installer_command("v1'; touch /tmp/pwned; '");
+
+        assert!(command.contains("MISE_VERSION='v1'\"'\"'; touch /tmp/pwned; '\"'\"''"));
     }
 }
