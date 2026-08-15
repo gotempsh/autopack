@@ -205,8 +205,10 @@ pub fn record_runtime_libraries(binary: &str, record_to: &str) -> String {
                echo \"autopack: refusing to look up '$lib': not a library name\" >&2; \
                exit 1 ;; \
            esac; \
-           owners=$(find /lib /usr/lib -name \"$lib\" -print 2>/dev/null \
-             | xargs -r readlink -f | sort -u \
+           owners=$(for path in /lib/\"$lib\" /usr/lib/\"$lib\" \
+             /lib/*-linux-gnu*/\"$lib\" /usr/lib/*-linux-gnu*/\"$lib\"; do \
+               if [ -e \"$path\" ]; then readlink -f \"$path\"; fi; \
+             done | sort -u \
              | xargs -r dpkg-query -S 2>/dev/null \
              | cut -d: -f1 | sort -u); \
            if [ -z \"$owners\" ]; then \
@@ -243,12 +245,13 @@ pub fn install_recorded_runtime_libraries(record_to: &str) -> String {
     format!(
         "set -eu; \
          if [ -s {record_to} ]; then \
-           count=$(wc -l < {record_to}); \
-           if [ \"$count\" -gt 256 ]; then \
+           count=$(awk 'END {{ print NR }}' {record_to}); \
+           bytes=$(wc -c < {record_to}); \
+           if [ \"$count\" -gt 256 ] || [ \"$bytes\" -gt 16384 ]; then \
              echo 'autopack: refusing an oversized runtime package list' >&2; \
              exit 1; \
            fi; \
-           while IFS= read -r package; do \
+           while IFS= read -r package || [ -n \"$package\" ]; do \
              case \"$package\" in \
                ''|?|[!a-z0-9]*|*[!a-z0-9+.-]*) \
                  echo \"autopack: invalid recorded runtime package: $package\" >&2; exit 1 ;; \
@@ -292,6 +295,7 @@ mod tests {
 
         // Installed libraries are resolved through trusted system paths.
         assert!(script.contains("dpkg-query -S"));
+        assert!(!script.contains("find /lib /usr/lib"));
         // Missing libraries are looked up rather than dropped on the floor.
         assert!(script.contains("apt-file search"));
 
@@ -335,7 +339,8 @@ mod tests {
     fn recorded_runtime_packages_are_revalidated_before_apt() {
         let dir = tempfile::tempdir().unwrap();
         let record = dir.path().join("runtime-deps");
-        fs::write(&record, "-o\n").unwrap();
+        // No trailing newline: validation and bounds must still include it.
+        fs::write(&record, "-o").unwrap();
 
         let script = install_recorded_runtime_libraries(record.to_str().unwrap());
         assert!(script.contains("-- $(cat"));
