@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.2] - 2026-08-15
+
+### CI
+
+- **release:** Build the Intel macOS binary on Apple silicon ([#10](https://github.com/gotempsh/autopack/issues/10))
+
+### Fixed
+
+- **node:** Make Puppeteer and Playwright apps work at run time ([#11](https://github.com/gotempsh/autopack/issues/11))
+- Harden plan generation against app-controlled strings ([#12](https://github.com/gotempsh/autopack/issues/12))
+- Resolve libraries ldd reports as missing instead of dropping them ([#19](https://github.com/gotempsh/autopack/issues/19))
+- **node:** Discover the browser's libraries instead of hardcoding them ([#20](https://github.com/gotempsh/autopack/issues/20))
+- **python:** Support mise source-build fallback ([#22](https://github.com/gotempsh/autopack/issues/22))
+
 ## [0.1.1] - 2026-08-05
 
 ### Added
