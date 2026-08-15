@@ -24,7 +24,7 @@ pub const APP_DIR: &str = "/app";
 pub const DEFAULT_BASE_IMAGE: &str = "debian:bookworm-slim";
 
 /// Packages installed in every builder image, needed to bootstrap mise.
-const BOOTSTRAP_APT_PACKAGES: &[&str] = &["ca-certificates", "curl", "git"];
+const BOOTSTRAP_APT_PACKAGES: &[&str] = &["ca-certificates", "curl", "git", "gnupg"];
 
 /// Packages installed in every runtime image.
 ///
