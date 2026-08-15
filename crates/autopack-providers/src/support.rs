@@ -149,7 +149,10 @@ pub fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
 }
 
-/// Record which Debian packages own the shared libraries `glob` links against.
+/// Package that provides the non-executing ELF inspector below.
+pub const ELF_INSPECTION_PACKAGE: &str = "binutils";
+
+/// Record which Debian packages own the shared libraries `binary` links against.
 ///
 /// Runs in the build stage, where the `-dev` packages are still installed.
 ///
@@ -159,16 +162,11 @@ pub fn shell_quote(value: &str) -> String {
 /// linker and then dpkg is release-agnostic, and it installs exactly what the
 /// binary links rather than a hand-maintained superset.
 ///
-/// `ldd` answers in two shapes, and both matter:
-///
-/// - `libfoo.so.1 => /usr/lib/.../libfoo.so.1` — resolved, so the file is on
-///   disk and `dpkg-query -S` names its owner.
-/// - `libfoo.so.1 => not found` — absent from the build image too, so there is
-///   no path to ask dpkg about. These are resolved with `apt-file`, which maps
-///   a filename to its providing package without needing the file present.
-///
-/// A soname reaches this from a binary the app produced, so it is untrusted
-/// input, and it is handled twice over.
+/// The binary is app-produced and untrusted. `readelf` parses its dynamic
+/// section without invoking its ELF interpreter; `ldd` must not be used here
+/// because it can execute a hostile interpreter. Installed libraries are
+/// resolved from trusted system directories, and absent ones through
+/// `apt-file`.
 ///
 /// It is validated against the characters a library name can actually contain,
 /// because `|` would otherwise escape the path anchor through alternation and
@@ -186,61 +184,78 @@ pub fn shell_quote(value: &str) -> String {
 /// `apt-file` and its ~90MB index are only fetched when something is actually
 /// missing.
 ///
-/// `glob` is expanded by the shell, so it may name several binaries — pathname
-/// expansion stays on for that line and is turned off only around the loop
-/// over sonames, where a `*` from a crafted `DT_NEEDED` would otherwise expand
-/// against the build directory.
-pub fn record_runtime_libraries(glob: &str, record_to: &str) -> String {
+pub fn record_runtime_libraries(binary: &str, record_to: &str) -> String {
+    let binary = shell_quote(binary);
+    let record_to = shell_quote(record_to);
     format!(
         "set -eu; \
          export LC_ALL=C; \
          mkdir -p \"$(dirname {record_to})\"; \
-         ldd {glob} 2>/dev/null \
-           | awk '/=> \\// {{ print $3 }}' | sort -u \
-           | xargs -r readlink -f 2>/dev/null | sort -u \
-           | xargs -r dpkg-query -S 2>/dev/null \
-           | cut -d: -f1 | sort -u > {record_to}; \
-         missing=$(ldd {glob} 2>/dev/null | awk '/not found/ {{ print $1 }}' | sort -u); \
-         if [ -n \"$missing\" ]; then \
-           apt-get update >/dev/null; \
-           apt-get install -y --no-install-recommends apt-file >/dev/null; \
-           apt-file update >/dev/null; \
-           set -f; \
-           for lib in $missing; do \
-             case \"$lib\" in \
-               *[!A-Za-z0-9._+-]*) \
-                 echo \"autopack: refusing to look up '$lib': not a library name\" >&2; \
-                 exit 1 ;; \
-             esac; \
+         : > {record_to}; \
+         if ! dynamic=$(readelf -d -- {binary}); then \
+           echo 'autopack: failed to inspect runtime libraries' >&2; \
+           exit 1; \
+         fi; \
+         needed=$(printf '%s\\n' \"$dynamic\" \
+           | awk '$2 == \"(NEEDED)\" {{ print $5 }}' | tr -d '[]' | sort -u); \
+         set -f; \
+         for lib in $needed; do \
+           case \"$lib\" in \
+             ''|*[!A-Za-z0-9._+-]*) \
+               echo \"autopack: refusing to look up '$lib': not a library name\" >&2; \
+               exit 1 ;; \
+           esac; \
+           owners=$(find /lib /usr/lib -name \"$lib\" -print 2>/dev/null \
+             | xargs -r readlink -f | sort -u \
+             | xargs -r dpkg-query -S 2>/dev/null \
+             | cut -d: -f1 | sort -u); \
+           if [ -z \"$owners\" ]; then \
+             if ! command -v apt-file >/dev/null 2>&1; then \
+               apt-get update >/dev/null; \
+               apt-get install -y --no-install-recommends -- apt-file >/dev/null; \
+               apt-file update >/dev/null; \
+             fi; \
              pattern=$(printf '%s' \"$lib\" | sed 's/[.+]/\\\\&/g'); \
              owners=$(apt-file search -x \"^/(usr/)?lib/[a-z0-9_]*-linux-gnu[a-z0-9]*/$pattern\\$\" \
                | cut -d: -f1 | sort -u); \
-             count=$(printf '%s' \"$owners\" | grep -c . || true); \
-             if [ \"$count\" -eq 0 ]; then \
-               echo \"autopack: no package provides $lib\" >&2; \
-               exit 1; \
-             fi; \
-             if [ \"$count\" -gt 1 ]; then \
-               echo \"autopack: $lib is provided by more than one package:\" >&2; \
-               printf '  %s\\n' $owners >&2; \
-               echo \"Choose one and add it to apt_packages in autopack.json.\" >&2; \
-               exit 1; \
-             fi; \
-             printf '%s\\n' \"$owners\" >> {record_to}; \
-           done; \
-           sort -u -o {record_to} {record_to}; \
-         fi; \
+           fi; \
+           count=$(printf '%s' \"$owners\" | grep -c . || true); \
+           if [ \"$count\" -eq 0 ]; then \
+             echo \"autopack: no package provides $lib\" >&2; \
+             exit 1; \
+           fi; \
+           if [ \"$count\" -gt 1 ]; then \
+             echo \"autopack: $lib is provided by more than one package:\" >&2; \
+             printf '  %s\\n' $owners >&2; \
+             echo \"Choose one and add it to apt_packages in autopack.json.\" >&2; \
+             exit 1; \
+           fi; \
+           printf '%s\\n' \"$owners\" >> {record_to}; \
+         done; \
+         sort -u -o {record_to} {record_to}; \
          cat {record_to}"
     )
 }
 
 /// Install the packages a previous [`record_runtime_libraries`] call recorded.
 pub fn install_recorded_runtime_libraries(record_to: &str) -> String {
+    let record_to = shell_quote(record_to);
     format!(
         "set -eu; \
          if [ -s {record_to} ]; then \
+           count=$(wc -l < {record_to}); \
+           if [ \"$count\" -gt 256 ]; then \
+             echo 'autopack: refusing an oversized runtime package list' >&2; \
+             exit 1; \
+           fi; \
+           while IFS= read -r package; do \
+             case \"$package\" in \
+               ''|?|[!a-z0-9]*|*[!a-z0-9+.-]*) \
+                 echo \"autopack: invalid recorded runtime package: $package\" >&2; exit 1 ;; \
+             esac; \
+           done < {record_to}; \
            apt-get update; \
-           apt-get install -y --no-install-recommends $(cat {record_to}); \
+           apt-get install -y --no-install-recommends -- $(cat {record_to}); \
            rm -rf /var/lib/apt/lists/*; \
          fi"
     )
@@ -253,6 +268,7 @@ pub const RUNTIME_DEPS_FILE: &str = "/usr/local/share/autopack-runtime-deps";
 mod tests {
     use super::*;
     use std::fs;
+    use std::process::Command as ProcessCommand;
 
     fn app_with(files: &[(&str, &str)]) -> (tempfile::TempDir, App) {
         let dir = tempfile::tempdir().unwrap();
@@ -269,10 +285,14 @@ mod tests {
     fn missing_libraries_are_resolved_and_hostile_sonames_refused() {
         let script = record_runtime_libraries("/app/bin/app", "/tmp/deps");
 
-        // Resolved libraries: unchanged path through dpkg.
+        // App-produced ELF files are parsed statically. `ldd` can execute a
+        // hostile ELF interpreter and must never appear in this command.
+        assert!(script.contains("readelf -d --"));
+        assert!(!script.contains("ldd "));
+
+        // Installed libraries are resolved through trusted system paths.
         assert!(script.contains("dpkg-query -S"));
-        // Missing ones are looked up rather than dropped on the floor.
-        assert!(script.contains("/not found/"));
+        // Missing libraries are looked up rather than dropped on the floor.
         assert!(script.contains("apt-file search"));
 
         // A soname comes from a binary the app produced. Anything outside the
@@ -287,15 +307,12 @@ mod tests {
         // the anchored directory.
         assert!(script.contains("sed 's/[.+]/"));
 
-        // Globbing off, so a soname of `*` cannot expand against the build
-        // directory; deterministic collation, so the same source does not
-        // resolve differently on two builders.
+        // Globbing off, so a hostile soname cannot expand against the build
+        // directory; deterministic collation keeps owner selection stable.
         assert!(script.contains("set -eu"));
-        // Globbing is off for the soname loop but must stay on for `ldd`,
-        // whose argument is a glob for callers that inspect several binaries.
-        let ldd = script.find("ldd ").unwrap();
+        let readelf = script.find("readelf ").unwrap();
         let disable = script.find("set -f;").unwrap();
-        assert!(ldd < disable);
+        assert!(readelf < disable);
         assert!(script.contains("LC_ALL=C"));
 
         // The anchor covers /lib as well as /usr/lib: on Debian the essential
@@ -309,9 +326,29 @@ mod tests {
         assert!(script.contains("provided by more than one package"));
         assert!(script.contains("add it to apt_packages"));
 
-        // The ~90MB index is only fetched when there is something to look up.
-        let guard = script.find("if [ -n \"$missing\" ]").unwrap();
+        // The ~90MB index is fetched only when the library is not installed.
+        let guard = script.find("if [ -z \"$owners\" ]").unwrap();
         assert!(guard < script.find("apt-file update").unwrap());
+    }
+
+    #[test]
+    fn recorded_runtime_packages_are_revalidated_before_apt() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = dir.path().join("runtime-deps");
+        fs::write(&record, "-o\n").unwrap();
+
+        let script = install_recorded_runtime_libraries(record.to_str().unwrap());
+        assert!(script.contains("-- $(cat"));
+        let output = ProcessCommand::new("sh")
+            .arg("-c")
+            .arg(script)
+            .output()
+            .unwrap();
+
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("invalid recorded runtime package")
+        );
     }
 
     #[test]
