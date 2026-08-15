@@ -11,8 +11,9 @@ use autopack_core::{steps, App, BuildContext, Environment, Provider, Result, APP
 
 use crate::support::{
     caddy_layer, caddy_start_command, caddyfile, install_recorded_runtime_libraries,
-    normalize_version_range, procfile_web_command, read_version_file, record_runtime_libraries,
-    CADDYFILE_PATH, RUNTIME_DEPS_FILE,
+    normalize_version_range, procfile_web_command, read_version_file,
+    record_runtime_libraries_from_command, CADDYFILE_PATH, ELF_INSPECTION_PACKAGE,
+    RUNTIME_DEPS_FILE,
 };
 
 /// Where a Next.js standalone bundle is staged for the runtime image.
@@ -24,7 +25,7 @@ const PLAYWRIGHT_BROWSERS: &str = ".local-browsers";
 
 /// Fonts a browser needs but never links.
 ///
-/// Everything else Chromium requires is a `DT_NEEDED` entry, so `ldd` finds it
+/// Everything else Chromium requires is a `DT_NEEDED` entry, so `readelf` finds it
 /// — measured against Chrome for Testing: with the discovered set installed
 /// there are zero unresolved libraries and it renders, screenshots and prints.
 /// Fonts are the exception. They are opened through fontconfig at run time, so
@@ -152,6 +153,8 @@ impl Provider for NodeProvider {
         ctx.deploy_apt_packages
             .extend(browsers.runtime_packages.iter().cloned());
         if !browsers.browser_searches.is_empty() {
+            ctx.build_apt_packages
+                .push(ELF_INSPECTION_PACKAGE.to_string());
             ctx.add_runtime_input(Layer::step(steps::INSTALL).including([RUNTIME_DEPS_FILE]));
             ctx.add_runtime_command(Command::shell(install_recorded_runtime_libraries(
                 RUNTIME_DEPS_FILE,
@@ -263,8 +266,8 @@ PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD), either unset it or drop the dependency.' >&2;
                    exit 1; \
                  fi"
             )));
-            step.add_command(Command::shell(record_runtime_libraries(
-                &format!("$({search})"),
+            step.add_command(Command::shell(record_runtime_libraries_from_command(
+                &search,
                 RUNTIME_DEPS_FILE,
             )));
         }
@@ -530,7 +533,7 @@ fn node_version(app: &App, package: &PackageJson) -> Result<(String, String)> {
 /// Browser tooling an app needs wired up: the system libraries the browser
 /// links against, where it is cached, and how it is fetched.
 struct BrowserTooling {
-    /// Debian packages the runtime image needs that `ldd` cannot discover.
+    /// Debian packages the runtime image needs that ELF inspection cannot discover.
     ///
     /// Fonts only. A browser does not link them — it opens them through
     /// fontconfig at run time — so nothing about the binary reveals that they
@@ -1025,7 +1028,7 @@ mod tests {
         let analysis = plan_for(&app);
 
         // No hardcoded library closure: the runtime image installs whatever
-        // `ldd` found the browser to link, plus fonts, which are opened
+        // static ELF inspection found the browser to link, plus fonts, which are opened
         // through fontconfig and so are invisible to the linker.
         let runtime = analysis.plan.step("runtime").unwrap();
         let apt = runtime.commands[0].display_name();
@@ -1046,7 +1049,7 @@ mod tests {
                 .commands
                 .iter()
                 .any(|c| {
-                    c.display_name().contains("ldd ")
+                    c.display_name().contains("readelf ")
                         && c.display_name().contains(PLAYWRIGHT_BROWSERS)
                 }),
             "install step does not inspect the browser"
@@ -1214,7 +1217,7 @@ mod tests {
         assert!(names[guard].contains("SKIP_DOWNLOAD"));
 
         // The guard has to run before the inspection it protects.
-        let record = names.iter().position(|n| n.contains("ldd ")).unwrap();
+        let record = names.iter().position(|n| n.contains("readelf ")).unwrap();
         assert!(guard < record, "{names:?}");
     }
 
@@ -1241,7 +1244,7 @@ mod tests {
             .commands
             .iter()
             .map(|c| c.display_name())
-            .find(|n| n.contains("ldd "))
+            .find(|n| n.contains("readelf "))
             .expect("no discovery command");
         assert!(record.contains("find "), "{record}");
         // Both binaries: Playwright launches the headless shell by default,
