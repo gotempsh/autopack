@@ -8,6 +8,36 @@ use crate::support::{normalize_version_range, procfile_web_command, read_version
 /// Python version used when the project does not pin one.
 const DEFAULT_PYTHON_VERSION: &str = "3.12";
 
+/// Packages required when mise cannot use a precompiled Python artifact and
+/// falls back to python-build. Keep these provider-specific: runtimes such as
+/// Node and Go do not need a C toolchain in their packages layer.
+const CPYTHON_BUILD_PACKAGES: &[&str] = &[
+    "build-essential",
+    "libbz2-dev",
+    "libffi-dev",
+    "liblzma-dev",
+    "libncursesw5-dev",
+    "libreadline-dev",
+    "libsqlite3-dev",
+    "libssl-dev",
+    "xz-utils",
+    "zlib1g-dev",
+];
+
+/// Shared libraries used by the core extension modules produced by the source
+/// build above. The development packages stay in the builder; only these
+/// runtime libraries reach the deployed image.
+const CPYTHON_RUNTIME_PACKAGES: &[&str] = &[
+    "libbz2-1.0",
+    "libffi8",
+    "liblzma5",
+    "libncursesw6",
+    "libreadline8",
+    "libsqlite3-0",
+    "libssl3",
+    "zlib1g",
+];
+
 /// Virtualenv every install goes into, so dependencies live under `/app`.
 const VENV: &str = "/app/.venv";
 
@@ -138,6 +168,16 @@ impl Provider for PythonProvider {
 
         let (version, source) = python_version(ctx.app, &pyproject)?;
         ctx.packages.add("python", &version, source);
+        ctx.build_apt_packages.extend(
+            CPYTHON_BUILD_PACKAGES
+                .iter()
+                .map(|package| package.to_string()),
+        );
+        ctx.deploy_apt_packages.extend(
+            CPYTHON_RUNTIME_PACKAGES
+                .iter()
+                .map(|package| package.to_string()),
+        );
         if let Some(tool) = installer.mise_tool() {
             ctx.packages.add(tool, "latest", "installer");
         }
@@ -424,6 +464,56 @@ mod tests {
             analysis.plan.deploy.start_command.as_deref(),
             Some("gunicorn app:app --bind 0.0.0.0:${PORT:-8000}")
         );
+    }
+
+    #[test]
+    fn python_source_build_has_compiler_and_runtime_libraries() {
+        let (_dir, app) = write_app(&[("main.py", "print('hi')\n")]);
+        let analysis = plan_for(&app);
+
+        let package_commands: Vec<String> = analysis
+            .plan
+            .step(steps::PACKAGES)
+            .expect("Python must have a packages step")
+            .commands
+            .iter()
+            .map(|command| command.display_name())
+            .collect();
+        let apt_install = package_commands
+            .first()
+            .expect("system packages must be installed before mise");
+        for package in CPYTHON_BUILD_PACKAGES {
+            assert!(
+                apt_install.contains(package),
+                "Python source-build package `{package}` is missing: {apt_install}"
+            );
+        }
+        assert!(
+            package_commands
+                .iter()
+                .position(|command| command.contains("mise install"))
+                .is_some_and(|mise| mise > 0),
+            "mise must run after the source-build dependencies: {package_commands:?}"
+        );
+
+        let runtime_commands: Vec<String> = analysis
+            .plan
+            .step(steps::RUNTIME)
+            .expect("Python must have a runtime step")
+            .commands
+            .iter()
+            .map(|command| command.display_name())
+            .collect();
+        let runtime_apt = runtime_commands
+            .first()
+            .expect("Python runtime libraries must be installed");
+        for package in CPYTHON_RUNTIME_PACKAGES {
+            assert!(
+                runtime_apt.contains(package),
+                "Python runtime package `{package}` is missing: {runtime_apt}"
+            );
+        }
+        assert!(!runtime_apt.contains("build-essential"), "{runtime_apt}");
     }
 
     #[test]
