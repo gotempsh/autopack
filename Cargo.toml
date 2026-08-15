@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 rust-version = "1.82"
 license = "MIT"
@@ -12,9 +12,9 @@ homepage = "https://github.com/gotempsh/autopack"
 authors = ["Temps <hello@temps.sh>"]
 
 [workspace.dependencies]
-autopack-core = { version = "0.1.2", path = "crates/autopack-core" }
-autopack-providers = { version = "0.1.2", path = "crates/autopack-providers" }
-autopack-dockerfile = { version = "0.1.2", path = "crates/autopack-dockerfile" }
+autopack-core = { version = "0.1.3", path = "crates/autopack-core" }
+autopack-providers = { version = "0.1.3", path = "crates/autopack-providers" }
+autopack-dockerfile = { version = "0.1.3", path = "crates/autopack-dockerfile" }
 
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
