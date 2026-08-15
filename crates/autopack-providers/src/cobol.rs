@@ -5,7 +5,7 @@ use autopack_core::{steps, App, BuildContext, Environment, Error, Provider, Resu
 
 use crate::support::{
     install_recorded_runtime_libraries, procfile_web_command, record_runtime_libraries,
-    RUNTIME_DEPS_FILE,
+    ELF_INSPECTION_PACKAGE, RUNTIME_DEPS_FILE,
 };
 
 /// Where the compiled program is placed.
@@ -34,6 +34,8 @@ impl Provider for CobolProvider {
         // GnuCOBOL comes from apt: there is no upstream toolchain tarball and
         // no mise plugin worth depending on.
         ctx.build_apt_packages.push("gnucobol".to_string());
+        ctx.build_apt_packages
+            .push(ELF_INSPECTION_PACKAGE.to_string());
 
         // `-free` selects free-format source. Fixed-format COBOL (columns 7-72)
         // is still common, and the two are not interchangeable, so it is
