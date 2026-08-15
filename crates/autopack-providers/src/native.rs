@@ -29,25 +29,6 @@ pub struct NativeDependency {
     pub runtime: &'static [&'static str],
 }
 
-/// Chromium's shared library closure, needed by headless browsers.
-pub(crate) const CHROMIUM_RUNTIME: &[&str] = &[
-    "libnss3",
-    "libnspr4",
-    "libatk1.0-0",
-    "libatk-bridge2.0-0",
-    "libcups2",
-    "libdrm2",
-    "libxkbcommon0",
-    "libxcomposite1",
-    "libxdamage1",
-    "libxfixes3",
-    "libxrandr2",
-    "libgbm1",
-    "libasound2",
-    "libpango-1.0-0",
-    "libcairo2",
-];
-
 /// Node packages that need system libraries.
 pub const NODE: &[NativeDependency] = &[
     // node-canvas compiles against Cairo and friends; there are no prebuilt

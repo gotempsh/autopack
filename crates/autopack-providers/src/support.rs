@@ -185,19 +185,44 @@ pub const ELF_INSPECTION_PACKAGE: &str = "binutils";
 /// missing.
 ///
 pub fn record_runtime_libraries(binary: &str, record_to: &str) -> String {
-    let binary = shell_quote(binary);
+    let binaries = format!("printf '%s\\n' {}", shell_quote(binary));
+    record_runtime_libraries_from_command(&binaries, record_to)
+}
+
+/// Record the union of runtime libraries for newline-delimited binary paths
+/// emitted by a trusted provider command.
+pub(crate) fn record_runtime_libraries_from_command(binaries: &str, record_to: &str) -> String {
     let record_to = shell_quote(record_to);
     format!(
         "set -eu; \
          export LC_ALL=C; \
          mkdir -p \"$(dirname {record_to})\"; \
          : > {record_to}; \
-         if ! dynamic=$(readelf -d -- {binary}); then \
-           echo 'autopack: failed to inspect runtime libraries' >&2; \
+         binaries_file=/tmp/autopack-runtime-binaries; \
+         needed_file=/tmp/autopack-needed-libraries; \
+         ({binaries}) > \"$binaries_file\"; \
+         if [ ! -s \"$binaries_file\" ]; then \
+           echo 'autopack: no runtime binary was found to inspect' >&2; \
            exit 1; \
          fi; \
-         needed=$(printf '%s\\n' \"$dynamic\" \
-           | awk '$2 == \"(NEEDED)\" {{ print $5 }}' | tr -d '[]' | sort -u); \
+         : > \"$needed_file\"; \
+         while IFS= read -r binary; do \
+           case \"$binary\" in \
+             /app/*) ;; \
+             *) echo \"autopack: refusing to inspect binary outside /app: $binary\" >&2; exit 1 ;; \
+           esac; \
+           if [ ! -f \"$binary\" ]; then \
+             echo \"autopack: runtime binary is not a file: $binary\" >&2; \
+             exit 1; \
+           fi; \
+           if ! dynamic=$(readelf -d -- \"$binary\"); then \
+             echo \"autopack: failed to inspect runtime libraries for $binary\" >&2; \
+             exit 1; \
+           fi; \
+           printf '%s\\n' \"$dynamic\" \
+             | awk '$2 == \"(NEEDED)\" {{ print $5 }}' | tr -d '[]' >> \"$needed_file\"; \
+         done < \"$binaries_file\"; \
+         needed=$(sort -u \"$needed_file\"); \
          set -f; \
          for lib in $needed; do \
            case \"$lib\" in \
