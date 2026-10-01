@@ -1,7 +1,7 @@
 //! Helpers shared by providers.
 
-use autopack_core::plan::Layer;
-use autopack_core::{App, Procfile, Result};
+use autopack_core::plan::{Command, Layer};
+use autopack_core::{App, BuildContext, Procfile, Result};
 
 /// Image the static file server binary is copied from.
 ///
@@ -15,9 +15,27 @@ pub const CADDY_BIN: &str = "/usr/bin/caddy";
 /// Path the generated Caddyfile is written to.
 pub const CADDYFILE_PATH: &str = "/app/Caddyfile";
 
+/// Name of the step that prepares the Caddy binary for the runtime image.
+pub const CADDY_STEP: &str = "caddy";
+
 /// A layer that copies the Caddy binary into the runtime image.
-pub fn caddy_layer() -> Layer {
-    Layer::image(CADDY_IMAGE).including([CADDY_BIN])
+///
+/// The binary in [`CADDY_IMAGE`] carries a `cap_net_bind_service` file
+/// capability so it can bind ports below 1024. A container started with
+/// every capability dropped (`--cap-drop ALL`) cannot exec a binary whose file
+/// capabilities exceed its bounding set, so the server would exit at once with
+/// "Operation not permitted". Caddy listens on `$PORT` here and never needs the
+/// capability, so a step re-copies the binary with `cp`, which does not carry
+/// extended attributes over, and the runtime image takes that copy.
+pub fn caddy_layer(ctx: &mut BuildContext<'_>) -> Layer {
+    if !ctx.has_step(CADDY_STEP) {
+        let step = ctx.step(CADDY_STEP);
+        step.inputs = vec![Layer::image(CADDY_IMAGE)];
+        step.add_command(Command::exec(format!(
+            "cp {CADDY_BIN} /tmp/caddy && mv /tmp/caddy {CADDY_BIN}"
+        )));
+    }
+    Layer::step(CADDY_STEP).including([CADDY_BIN])
 }
 
 /// Command that runs the generated Caddyfile.

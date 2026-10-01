@@ -52,7 +52,8 @@ impl Provider for StaticProvider {
 
         ctx.set_runtime_includes_runtimes(false);
         ctx.add_deploy_input(Layer::step(steps::BUILD).including([APP_DIR]));
-        ctx.add_deploy_input(caddy_layer());
+        let caddy = caddy_layer(ctx);
+        ctx.add_deploy_input(caddy);
         ctx.set_start_command(caddy_start_command());
         Ok(())
     }
@@ -72,6 +73,8 @@ fn document_root(app: &App) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use autopack_core::plan::Command;
+
     use crate::test_support::{plan_for, write_app};
 
     #[test]
@@ -92,6 +95,37 @@ mod tests {
         // No language runtime is installed at all.
         assert!(analysis.plan.step("packages").is_none());
         assert!(analysis.packages.is_empty());
+    }
+
+    #[test]
+    fn caddy_is_copied_without_its_file_capability() {
+        // The binary in the official image carries a file capability, which a
+        // container with every capability dropped refuses to exec. The runtime
+        // image must take the re-copied binary from the `caddy` step, never
+        // the original straight from the registry image.
+        let (_dir, app) = write_app(&[("index.html", "<h1>hi</h1>")]);
+        let analysis = plan_for(&app);
+
+        let step = analysis
+            .plan
+            .step(crate::support::CADDY_STEP)
+            .expect("a caddy step");
+        assert_eq!(
+            step.inputs[0].image.as_deref(),
+            Some(crate::support::CADDY_IMAGE)
+        );
+        assert!(step.commands.iter().any(|command| matches!(
+            command,
+            Command::Exec(exec) if exec.cmd.starts_with("cp /usr/bin/caddy ")
+        )));
+
+        let deploy = &analysis.plan.deploy.inputs;
+        assert!(deploy
+            .iter()
+            .any(|input| input.step.as_deref() == Some(crate::support::CADDY_STEP)));
+        assert!(!deploy
+            .iter()
+            .any(|input| input.image.as_deref() == Some(crate::support::CADDY_IMAGE)));
     }
 
     #[test]

@@ -315,7 +315,8 @@ PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD), either unset it or drop the dependency.' >&2;
 
         ctx.set_runtime_includes_runtimes(false);
         ctx.add_deploy_input(Layer::step(steps::BUILD).including([root.as_str(), CADDYFILE_PATH]));
-        ctx.add_deploy_input(caddy_layer());
+        let caddy = caddy_layer(ctx);
+        ctx.add_deploy_input(caddy);
         ctx.set_start_command(caddy_start_command());
         ctx.add_metadata("serve", format!("caddy static ({})", site.directory));
         Ok(())
@@ -752,7 +753,7 @@ mod tests {
             .deploy
             .inputs
             .iter()
-            .any(|input| input.image.as_deref() == Some(crate::support::CADDY_IMAGE)));
+            .any(|input| input.step.as_deref() == Some(crate::support::CADDY_STEP)));
         // Node is a build-time dependency only.
         assert!(!analysis
             .plan
