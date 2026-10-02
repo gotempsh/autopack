@@ -29,7 +29,7 @@ const CPYTHON_BUILD_PACKAGES: &[&str] = &[
 /// runtime libraries reach the deployed image.
 const CPYTHON_RUNTIME_PACKAGES: &[&str] = &[
     "libbz2-1.0",
-    "libffi8",
+    "libffi8|libffi7",
     "liblzma5",
     "libncursesw6",
     "libreadline8",
@@ -205,9 +205,62 @@ impl Provider for PythonProvider {
         ctx.deploy_apt_packages.extend(runtime_packages);
 
         self.plan_install(ctx, installer)?;
+        if !mentions_package(&declared, "setuptools") {
+            // Python 3.12+ venvs ship without setuptools, and anything still
+            // importing `pkg_resources` (gunicorn before 22, many older
+            // libraries) dies at start with "No module named
+            // 'pkg_resources'". setuptools 81 removed the module, so the
+            // fallback stays below it. A no-op when it is already importable.
+            let install = match installer {
+                Installer::Uv => "uv pip install 'setuptools<81'",
+                Installer::Poetry | Installer::Pipenv | Installer::Pip => {
+                    "pip install --no-cache-dir 'setuptools<81'"
+                }
+            };
+            ctx.step(steps::INSTALL).add_command(Command::shell(format!(
+                "python -c 'import pkg_resources' 2>/dev/null || {install}"
+            )));
+        }
 
+        let is_django = django_wsgi_module(ctx.app)?.is_some();
+        if is_django {
+            if let Some(database) = django_sqlite_database(ctx.app)? {
+                let reason = "Django's database is a SQLite file inside the container; \
+                              without persistent storage its data is lost on every \
+                              redeploy. Use a database server instead by configuring \
+                              DATABASES in settings.";
+                ctx.require_persistent_path(
+                    database.path,
+                    reason,
+                    if database.reads_database_url {
+                        &["DATABASE_URL"]
+                    } else {
+                        &[]
+                    },
+                );
+            }
+        }
         let build = ctx.step(steps::BUILD);
         build.inputs = vec![Layer::step(steps::INSTALL), Layer::local()];
+        if is_django {
+            // WhiteNoise and `STATIC_ROOT` serve files `collectstatic` writes;
+            // without it every page that references a static asset is a 500.
+            // Heroku's buildpack runs it the same way. Settings modules
+            // commonly insist on a secret key at import time, which this
+            // command does not use, so a placeholder stands in when none is
+            // set. Failure only warns: plenty of apps never configured static
+            // files and run fine without them.
+            build.add_command(Command::shell(
+                "if [ -z \"${DISABLE_COLLECTSTATIC:-}\" ]; then \
+                   SECRET_KEY=\"${SECRET_KEY:-autopack-collectstatic}\" \
+                   DJANGO_SECRET_KEY=\"${DJANGO_SECRET_KEY:-autopack-collectstatic}\" \
+                   python manage.py collectstatic --noinput \
+                   || echo 'autopack: collectstatic failed, so static files were not collected. \
+                   Fix STATIC_ROOT, or set DISABLE_COLLECTSTATIC=1 to skip it.' >&2; \
+                 fi",
+            ));
+            ctx.add_metadata("staticFiles", "python manage.py collectstatic --noinput");
+        }
 
         ctx.add_deploy_input(Layer::step(steps::BUILD).including([APP_DIR]));
         // Unbuffered output, or logs vanish when the container is killed.
@@ -318,6 +371,26 @@ impl PythonProvider {
     }
 }
 
+/// Whether `declared` (requirements, pyproject, Pipfile text) names `package`
+/// as a dependency rather than just containing the string.
+fn mentions_package(declared: &str, package: &str) -> bool {
+    declared.lines().any(|line| {
+        let line = line
+            .trim()
+            .trim_start_matches(['"', '\''])
+            .to_ascii_lowercase();
+        line.strip_prefix(package).is_some_and(|rest| {
+            rest.is_empty()
+                || rest.starts_with(|c: char| {
+                    matches!(
+                        c,
+                        '=' | '<' | '>' | '~' | '!' | '[' | ' ' | ';' | '"' | '\''
+                    )
+                })
+        })
+    })
+}
+
 /// Add a server package the project did not declare.
 fn add_server_package(ctx: &mut BuildContext<'_>, installer: Installer, package: &str) {
     let command = match installer {
@@ -378,6 +451,42 @@ fn django_wsgi_module(app: &App) -> Result<Option<String>> {
     Ok(candidates
         .first()
         .map(|path| path.trim_end_matches(".py").replace('/', ".")))
+}
+
+/// A SQLite database Django settings configure.
+struct DjangoSqlite {
+    /// The database file, as the runtime image sees it.
+    path: String,
+    /// Whether the settings let `DATABASE_URL` replace it (dj-database-url,
+    /// django-environ).
+    reads_database_url: bool,
+}
+
+/// The SQLite database the Django settings use, if any.
+///
+/// Settings are Python, so this is a reading of their text: a SQLite engine
+/// anywhere in the settings modules, the conventional `db.sqlite3` file name,
+/// and whether `DATABASE_URL` is consulted at all.
+fn django_sqlite_database(app: &App) -> Result<Option<DjangoSqlite>> {
+    let mut settings = String::new();
+    for pattern in ["*/settings.py", "*/settings/*.py"] {
+        for file in app.find_files(pattern)? {
+            settings.push_str(&app.read_file(&file)?);
+            settings.push('\n');
+        }
+    }
+    if !settings.contains("django.db.backends.sqlite3") {
+        return Ok(None);
+    }
+    let path = if settings.contains("db.sqlite3") {
+        format!("{APP_DIR}/db.sqlite3")
+    } else {
+        APP_DIR.to_string()
+    };
+    Ok(Some(DjangoSqlite {
+        path,
+        reads_database_url: settings.contains("DATABASE_URL"),
+    }))
 }
 
 /// Raw text of every dependency declaration, for substring checks.
@@ -458,6 +567,9 @@ mod tests {
                 "python -m venv /app/.venv".to_string(),
                 "PATH += /app/.venv/bin".to_string(),
                 "pip install -r requirements.txt".to_string(),
+                "python -c 'import pkg_resources' 2>/dev/null \
+                 || pip install --no-cache-dir 'setuptools<81'"
+                    .to_string(),
             ]
         );
         assert_eq!(
@@ -582,5 +694,119 @@ mod tests {
             analysis.plan.deploy.start_command.as_deref(),
             Some("python main.py")
         );
+    }
+
+    #[test]
+    fn setuptools_is_only_backfilled_when_the_app_does_not_pin_it() {
+        let install = |requirements: &str| {
+            let (_dir, app) = write_app(&[
+                ("requirements.txt", requirements),
+                ("app.py", "from flask import Flask\napp = Flask(__name__)\n"),
+            ]);
+            plan_for(&app)
+                .plan
+                .step("install")
+                .unwrap()
+                .commands
+                .iter()
+                .map(|command| command.display_name())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        // An old gunicorn imports pkg_resources at start.
+        assert!(install("flask==2.0.1\ngunicorn==20.1.0\n").contains("setuptools<81"));
+        assert!(!install("flask\nsetuptools==69.0.0\n").contains("setuptools<81"));
+        // A package merely containing the name is not a pin.
+        assert!(install("flask\nsetuptools-scm\n").contains("setuptools<81"));
+    }
+
+    #[test]
+    fn django_collects_static_files_during_the_build() {
+        let (_dir, app) = write_app(&[
+            (
+                "requirements.txt",
+                "django==5.0\ngunicorn==22.0\nwhitenoise\n",
+            ),
+            ("manage.py", ""),
+            ("mysite/wsgi.py", "application = None"),
+        ]);
+        let analysis = plan_for(&app);
+        let build = analysis.plan.step("build").unwrap();
+        let command = build
+            .commands
+            .iter()
+            .map(|command| command.display_name())
+            .find(|command| command.contains("collectstatic"))
+            .expect("a collectstatic command");
+        assert!(command.contains("DISABLE_COLLECTSTATIC"));
+        assert!(command.contains("SECRET_KEY"));
+        assert!(command.contains("|| echo"), "a failure must only warn");
+    }
+
+    #[test]
+    fn a_django_sqlite_database_needs_persistent_storage() {
+        let (_dir, app) = write_app(&[
+            ("requirements.txt", "django==5.0\ngunicorn==22.0\n"),
+            ("manage.py", ""),
+            ("mysite/wsgi.py", ""),
+            (
+                "mysite/settings.py",
+                "DATABASES = {'default': {'ENGINE': 'django.db.backends.sqlite3', \
+                 'NAME': BASE_DIR / 'db.sqlite3'}}\n",
+            ),
+        ]);
+        let deploy = plan_for(&app).plan.deploy;
+        assert_eq!(deploy.persistent_paths.len(), 1);
+        assert_eq!(deploy.persistent_paths[0].path, "/app/db.sqlite3");
+        assert!(deploy.persistent_paths[0].unless_set.is_empty());
+    }
+
+    #[test]
+    fn a_django_app_that_reads_database_url_can_avoid_persistent_storage() {
+        let (_dir, app) = write_app(&[
+            (
+                "requirements.txt",
+                "django==5.0\ngunicorn==22.0\ndj-database-url\n",
+            ),
+            ("manage.py", ""),
+            ("mysite/wsgi.py", ""),
+            (
+                "mysite/settings.py",
+                "DATABASES = {'default': dj_database_url.config(default='sqlite:///db.sqlite3', \
+                 env='DATABASE_URL')}\n# django.db.backends.sqlite3 fallback\n",
+            ),
+        ]);
+        let deploy = plan_for(&app).plan.deploy;
+        assert_eq!(deploy.persistent_paths[0].unless_set, vec!["DATABASE_URL"]);
+    }
+
+    #[test]
+    fn a_django_app_on_postgres_needs_no_persistent_storage() {
+        let (_dir, app) = write_app(&[
+            ("requirements.txt", "django==5.0\ngunicorn==22.0\n"),
+            ("manage.py", ""),
+            ("mysite/wsgi.py", ""),
+            (
+                "mysite/settings.py",
+                "DATABASES = {'default': {'ENGINE': 'django.db.backends.postgresql'}}\n",
+            ),
+        ]);
+        assert!(plan_for(&app).plan.deploy.persistent_paths.is_empty());
+    }
+
+    #[test]
+    fn non_django_apps_do_not_collect_static_files() {
+        let (_dir, app) = write_app(&[
+            ("requirements.txt", "flask\n"),
+            ("app.py", "from flask import Flask\napp = Flask(__name__)\n"),
+        ]);
+        let analysis = plan_for(&app);
+        assert!(!analysis
+            .plan
+            .step("build")
+            .unwrap()
+            .commands
+            .iter()
+            .any(|command| command.display_name().contains("collectstatic")));
     }
 }

@@ -2,13 +2,25 @@
 
 use serde::Deserialize;
 
-use autopack_core::plan::{Command, Layer};
+use autopack_core::plan::{Command, GeneratedValue, Layer};
 use autopack_core::{steps, App, BuildContext, Environment, Provider, Result, APP_DIR};
 
 use crate::support::procfile_web_command;
+use crate::version::Requirement;
 
 /// PHP version used when `composer.json` does not constrain one.
 const DEFAULT_PHP_VERSION: &str = "8.3";
+
+/// `major.minor` lines FrankenPHP publishes images for (`1-php8.4`). Older
+/// PHP has no FrankenPHP image at all, so asking for one fails the pull.
+const FRANKENPHP_PHP_VERSIONS: &[&str] = &["8.2", "8.3", "8.4", "8.5"];
+
+/// Newest line a range resolves to while it admits one: a brand-new PHP
+/// release is more likely to surface deprecations than to help.
+const PHP_RANGE_CEILING: &str = "8.4";
+
+/// Where the FrankenPHP image installs its binary.
+const FRANKENPHP_BINARY: &str = "/usr/local/bin/frankenphp";
 
 /// Image the Composer binary is copied from.
 const COMPOSER_IMAGE: &str = "composer:2";
@@ -133,6 +145,21 @@ struct ComposerJson {
     require: indexmap::IndexMap<String, String>,
 }
 
+/// The parts of composer.lock that constrain the PHP version.
+#[derive(Debug, Default, Deserialize)]
+struct ComposerLock {
+    #[serde(default)]
+    packages: Vec<LockedPackage>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct LockedPackage {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    require: indexmap::IndexMap<String, String>,
+}
+
 impl Provider for PhpProvider {
     fn id(&self) -> &'static str {
         "php"
@@ -148,11 +175,24 @@ impl Provider for PhpProvider {
 
     fn plan(&self, ctx: &mut BuildContext<'_>) -> Result<()> {
         let composer: ComposerJson = ctx.app.read_json_opt("composer.json")?.unwrap_or_default();
+        // A malformed lockfile is Composer's problem to report, not a reason
+        // to refuse to plan.
+        let lock: ComposerLock = ctx
+            .app
+            .read_json_opt("composer.lock")
+            .ok()
+            .flatten()
+            .unwrap_or_default();
 
-        let (version, source) = php_version(&composer);
+        let choice = php_version(&composer, &lock);
+        if let Some(note) = &choice.note {
+            ctx.add_note(note.clone());
+        }
+        let (version, source) = (choice.version, choice.source);
         let image = format!("dunglas/frankenphp:1-php{version}");
         ctx.set_base_image(&image);
         ctx.set_runtime_base_image(&image);
+        ctx.set_base_image_runtimes(["php"]);
         ctx.add_metadata("phpVersion", &version);
         ctx.add_metadata("phpVersionSource", source);
         ctx.add_metadata("image", &image);
@@ -193,10 +233,82 @@ impl Provider for PhpProvider {
             ctx.add_runtime_input(Layer::step(steps::BUILD).including(copied));
             ctx.add_runtime_command(Command::shell(install_recorded_runtime_libraries()));
         }
-        ctx.add_deploy_variable("APP_ENV", "production");
+        // Symfony only loads `config/packages/prod` for `prod`; Laravel and
+        // most others call it `production`.
+        let app_env = if framework == Some("symfony") {
+            "prod"
+        } else {
+            "production"
+        };
+        ctx.add_deploy_variable("APP_ENV", app_env);
+        // Caddy keeps its state under XDG directories that default to `/data`
+        // and `/config`, which only root can write; the container runs
+        // unprivileged.
+        ctx.add_deploy_variable("XDG_CONFIG_HOME", "/tmp/caddy/config");
+        ctx.add_deploy_variable("XDG_DATA_HOME", "/tmp/caddy/data");
+        match framework {
+            Some("laravel") => {
+                // Laravel logs to storage/logs by default, which nobody reads
+                // in a container.
+                ctx.add_deploy_variable("LOG_CHANNEL", "stderr");
+                // Every encrypted cookie and session depends on it, so it is
+                // generated once and kept, never baked into the image.
+                ctx.require_generated_variable(
+                    "APP_KEY",
+                    GeneratedValue::PrefixedBase64Secret { bytes: 32 },
+                );
+                ctx.require_generated_variable("APP_URL", GeneratedValue::PublicUrl);
+                if laravel_defaults_to_sqlite(ctx.app)? {
+                    ctx.require_persistent_path(
+                        LARAVEL_SQLITE,
+                        "Laravel's default database is a SQLite file inside the \
+                         container; it is created at start so the app boots, but \
+                         without persistent storage its data (users, sessions, jobs) is \
+                         lost on every redeploy. Set DB_CONNECTION and DB_HOST (or \
+                         DB_URL) to use a database server instead.",
+                        &["DB_URL", "DB_HOST"],
+                    );
+                }
+                let declares_release = autopack_core::Procfile::load(ctx.app)?
+                    .is_some_and(|procfile| procfile.release().is_some());
+                if !declares_release {
+                    ctx.add_task("release", LARAVEL_MIGRATE);
+                }
+            }
+            Some("symfony") => {
+                ctx.require_generated_variable(
+                    "APP_SECRET",
+                    GeneratedValue::HexSecret { bytes: 16 },
+                );
+            }
+            _ => {}
+        }
+
+        // The official image's binary carries a `cap_net_bind_service` file
+        // capability so it can bind :80. A container started with every
+        // capability dropped refuses to exec a binary whose file capabilities
+        // exceed its bounding set ("exec: frankenphp: Operation not
+        // permitted"), and the Caddyfile listens on $PORT, so the capability
+        // is never needed. `cp` does not carry the extended attribute over.
+        ctx.add_runtime_command(Command::shell(format!(
+            "cp {FRANKENPHP_BINARY} {FRANKENPHP_BINARY}.autopack \
+             && mv {FRANKENPHP_BINARY}.autopack {FRANKENPHP_BINARY}"
+        )));
 
         let start = match procfile_web_command(ctx.app)? {
+            Some(command) if heroku_php_server(&command).is_some() => {
+                ctx.add_note(format!(
+                    "Procfile web command `{command}` starts a Heroku-only server; \
+                     serving the same document root with FrankenPHP instead"
+                ));
+                if framework == Some("laravel") {
+                    laravel_start_command()
+                } else {
+                    format!("frankenphp run --config {CADDYFILE_PATH}")
+                }
+            }
             Some(command) => command,
+            None if framework == Some("laravel") => laravel_start_command(),
             None => format!("frankenphp run --config {CADDYFILE_PATH}"),
         };
         ctx.set_start_command(start);
@@ -218,22 +330,33 @@ impl PhpProvider {
         let mut extension_commands = Vec::new();
         for extension in extensions {
             let known = PHP_EXTENSIONS.iter().find(|e| e.name == extension);
+            let mut install = Vec::new();
             if let Some(known) = known {
                 ctx.build_apt_packages
                     .extend(known.build.iter().map(|p| p.to_string()));
                 ctx.deploy_apt_packages
                     .extend(known.runtime.iter().map(|p| p.to_string()));
                 if let Some(configure) = known.configure {
-                    extension_commands.push(configure.to_string());
-                }
-                if known.pecl {
-                    extension_commands.push(format!(
-                        "pecl install {extension} && docker-php-ext-enable {extension}"
-                    ));
-                    continue;
+                    install.push(configure.to_string());
                 }
             }
-            extension_commands.push(format!("docker-php-ext-install -j\"$(nproc)\" {extension}"));
+            if known.is_some_and(|known| known.pecl) {
+                install.push(format!(
+                    "pecl install {extension} && docker-php-ext-enable {extension}"
+                ));
+            } else {
+                install.push(format!("docker-php-ext-install -j\"$(nproc)\" {extension}"));
+            }
+            // Many `ext-*` requirements name extensions compiled into PHP
+            // itself (`json` since PHP 8, `ctype`, `mbstring`, `tokenizer`
+            // in the official image); building them again fails with
+            // "cannot stat 'modules/*'". Only build what is not loaded.
+            extension_commands.push(format!(
+                "if php -m | grep -qix '{extension}'; then \
+                   echo 'autopack: PHP extension {extension} is already built in'; \
+                 else {}; fi",
+                install.join(" && ")
+            ));
         }
 
         let step = ctx.step(steps::INSTALL);
@@ -279,6 +402,18 @@ impl PhpProvider {
                 "composer dump-autoload --optimize --no-dev --no-interaction",
             ));
         }
+
+        // Laravel's Vite (or Mix) build writes `public/build`; a page using
+        // `@vite` is a 500 without its manifest. It runs after Composer: Vite
+        // plugins such as Ziggy and Wayfinder call `php artisan`.
+        if let Some(front_end) = crate::node::plan_front_end(ctx, steps::BUILD)? {
+            if front_end.has_build_script {
+                let build = front_end.manager.run_command("build");
+                ctx.add_metadata("assets", &build);
+                ctx.step(steps::BUILD).add_command(Command::shell(build));
+            }
+        }
+        let step = ctx.step(steps::BUILD);
         let asset = step.add_asset("Caddyfile", config);
         step.add_command(Command::file(CADDYFILE_PATH, asset));
         Ok(())
@@ -313,10 +448,11 @@ fn record_runtime_libraries() -> String {
 
 /// Install the packages recorded during the build.
 fn install_recorded_runtime_libraries() -> String {
+    let apt_update = autopack_core::apt::update_command();
     format!(
         "set -eu; \
          if [ -s {PHP_RUNTIME_DEPS} ]; then \
-           apt-get update; \
+           {apt_update}; \
            apt-get install -y --no-install-recommends $(cat {PHP_RUNTIME_DEPS}); \
            rm -rf /var/lib/apt/lists/*; \
          fi"
@@ -333,37 +469,197 @@ fn requested_extensions(composer: &ComposerJson) -> Vec<String> {
         .collect()
 }
 
-/// The PHP version from `composer.json`'s `require.php` constraint.
-fn php_version(composer: &ComposerJson) -> (String, &'static str) {
-    if let Some(constraint) = composer.require.get("php") {
-        if let Some(version) = first_version(constraint) {
-            return (version, "composer.json require.php");
-        }
-    }
-    (DEFAULT_PHP_VERSION.to_string(), "autopack default")
+/// Where Laravel keeps its default SQLite database.
+const LARAVEL_SQLITE: &str = "/app/database/database.sqlite";
+
+/// Whether the app falls back to SQLite when `DB_CONNECTION` is unset, as
+/// Laravel 11 and later do (`env('DB_CONNECTION', 'sqlite')`).
+fn laravel_defaults_to_sqlite(app: &App) -> Result<bool> {
+    let config = app
+        .read_file_opt("config/database.php")?
+        .unwrap_or_default()
+        .replace('"', "'")
+        .replace(' ', "");
+    Ok(config.contains("env('DB_CONNECTION','sqlite')"))
 }
 
-/// `^8.2 || ^8.3` -> `8.2`. FrankenPHP publishes `major.minor` tags only.
-fn first_version(constraint: &str) -> Option<String> {
-    let first = constraint.split("||").next()?.split_whitespace().next()?;
-    let cleaned = first.trim_start_matches(['^', '~', '>', '=', '<', 'v']);
-    let mut parts = cleaned.split('.');
-    let major = parts.next()?;
-    let minor = parts.next().unwrap_or("0");
-    if !major.chars().all(|c| c.is_ascii_digit()) || major.is_empty() {
+/// Runs pending migrations without prompting.
+const LARAVEL_MIGRATE: &str = "php artisan migrate --force";
+
+/// Start a Laravel app: prepare its database, then serve.
+///
+/// A fresh Laravel app defaults to SQLite at `database/database.sqlite`, a
+/// file `composer create-project` creates and git ignores, so it never
+/// reaches the image; without it the first request that touches the session
+/// table is a 500. When no other database is configured the file is created,
+/// and pending migrations run either way, as Laravel's own deploy tooling
+/// does. A failure is reported but does not stop the server.
+fn laravel_start_command() -> String {
+    format!(
+        "if [ -z \"${{AUTOPACK_NO_MIGRATE:-}}\" ]; then \
+           if [ \"${{DB_CONNECTION:-sqlite}}\" = sqlite ] && [ -z \"${{DB_URL:-}}\" ]; then \
+             db=\"${{DB_DATABASE:-/app/database/database.sqlite}}\"; \
+             mkdir -p \"$(dirname \"$db\")\" && touch \"$db\"; \
+           fi; \
+           {LARAVEL_MIGRATE} || echo 'autopack: php artisan migrate failed; set AUTOPACK_NO_MIGRATE=1 to skip it' >&2; \
+         fi; exec frankenphp run --config {CADDYFILE_PATH}"
+    )
+}
+
+/// The PHP version to build with, and why.
+struct PhpVersionChoice {
+    version: String,
+    source: &'static str,
+    note: Option<String>,
+}
+
+/// The newest FrankenPHP-published PHP line that `composer.json` *and* every
+/// locked package accept.
+///
+/// Composer refuses to install a lockfile whose packages exclude the running
+/// interpreter, so the lock's constraints matter as much as the app's own.
+/// Ranges resolve to the newest admitted line rather than the lower bound:
+/// `^7.4 || ^8.0` has no FrankenPHP image at 7.4.
+fn php_version(composer: &ComposerJson, lock: &ComposerLock) -> PhpVersionChoice {
+    let app = composer
+        .require
+        .get("php")
+        .and_then(|constraint| Requirement::parse(constraint));
+    let locked: Vec<Requirement> = lock
+        .packages
+        .iter()
+        .filter_map(|package| package.require.get("php"))
+        .filter_map(|constraint| Requirement::parse(constraint))
+        .collect();
+
+    let all_admit = |candidate: &str| {
+        app.as_ref().is_none_or(|req| req.admits(candidate))
+            && locked.iter().all(|req| req.admits(candidate))
+    };
+    let newest = |admits: &dyn Fn(&str) -> bool| {
+        let settled = FRANKENPHP_PHP_VERSIONS
+            .iter()
+            .rev()
+            .copied()
+            .filter(|candidate| {
+                crate::version::Version::parse(candidate).map(|v| (v.major, v.minor))
+                    <= crate::version::Version::parse(PHP_RANGE_CEILING).map(|v| (v.major, v.minor))
+            })
+            .find(|candidate| admits(candidate));
+        settled.or_else(|| {
+            FRANKENPHP_PHP_VERSIONS
+                .iter()
+                .rev()
+                .copied()
+                .find(|candidate| admits(candidate))
+        })
+    };
+
+    if app.is_none() && locked.is_empty() {
+        return PhpVersionChoice {
+            version: DEFAULT_PHP_VERSION.to_string(),
+            source: "autopack default",
+            note: None,
+        };
+    }
+    if let Some(version) = newest(&all_admit) {
+        return PhpVersionChoice {
+            version: version.to_string(),
+            source: if locked.is_empty() {
+                "composer.json require.php"
+            } else {
+                "composer.json require.php and composer.lock"
+            },
+            note: None,
+        };
+    }
+    if let Some(app) = &app {
+        if let Some(version) = newest(&|candidate: &str| app.admits(candidate)) {
+            let blockers: Vec<&str> = lock
+                .packages
+                .iter()
+                .filter(|package| {
+                    package
+                        .require
+                        .get("php")
+                        .and_then(|constraint| Requirement::parse(constraint))
+                        .is_some_and(|req| !req.admits(version))
+                })
+                .map(|package| package.name.as_str())
+                .take(5)
+                .collect();
+            return PhpVersionChoice {
+                version: version.to_string(),
+                source: "composer.json require.php",
+                note: Some(format!(
+                    "no PHP version FrankenPHP publishes ({}) satisfies every locked package; \
+                     using PHP {version}. Composer may reject: {}",
+                    FRANKENPHP_PHP_VERSIONS.join(", "),
+                    blockers.join(", ")
+                )),
+            };
+        }
+    }
+    let oldest = FRANKENPHP_PHP_VERSIONS[0];
+    PhpVersionChoice {
+        version: oldest.to_string(),
+        source: "oldest FrankenPHP-supported PHP",
+        note: Some(format!(
+            "composer.json requires PHP {}, which FrankenPHP does not publish (it supports {}); \
+             building with PHP {oldest}, the closest available. Raise `require.php` if the app \
+             runs on it",
+            composer
+                .require
+                .get("php")
+                .map(String::as_str)
+                .unwrap_or("?"),
+            FRANKENPHP_PHP_VERSIONS.join(", ")
+        )),
+    }
+}
+
+/// The document root a Heroku PHP server command (`heroku-php-apache2 web/`)
+/// serves, when `command` is one. Those wrappers only exist on Heroku's stack.
+///
+/// Returns `Some(None)` for a wrapper with no document root argument.
+fn heroku_php_server(command: &str) -> Option<Option<String>> {
+    let mut words = command.split_whitespace();
+    let program = words.next()?;
+    let program = program.rsplit('/').next().unwrap_or(program);
+    if !matches!(program, "heroku-php-apache2" | "heroku-php-nginx") {
         return None;
     }
-    let minor: String = minor.chars().take_while(char::is_ascii_digit).collect();
-    if minor.is_empty() {
-        return None;
+    // Options (`-C nginx.conf`, `-F fpm.conf`, `-i php.ini`) take a value;
+    // the document root is the first bare argument.
+    let mut root = None;
+    let mut skip_value = false;
+    for word in words {
+        if skip_value {
+            skip_value = false;
+            continue;
+        }
+        if word.starts_with('-') {
+            skip_value = !word.contains('=');
+            continue;
+        }
+        root = Some(word.trim_matches('/').to_string());
+        break;
     }
-    Some(format!("{major}.{minor}"))
+    Some(root.filter(|root| !root.is_empty() && !root.contains("..")))
 }
 
 /// Where the front controller lives.
 fn document_root(ctx: &BuildContext<'_>) -> String {
     if let Some(configured) = ctx.env.config("PHP_ROOT") {
         return format!("{APP_DIR}/{}", configured.trim_matches('/'));
+    }
+    // A Heroku Procfile names the document root its server was given.
+    if let Ok(Some(command)) = procfile_web_command(ctx.app) {
+        if let Some(Some(root)) = heroku_php_server(&command) {
+            if ctx.app.has_dir(&root) {
+                return format!("{APP_DIR}/{root}");
+            }
+        }
     }
     // Laravel, Symfony and most modern frameworks put the front controller in
     // `public/`; exposing the repository root instead would serve `.env`.
@@ -409,6 +705,7 @@ fn caddyfile(document_root: &str) -> String {
 #[cfg(test)]
 mod tests {
     use crate::test_support::{plan_for, write_app};
+    use autopack_core::plan::GeneratedValue;
 
     #[test]
     fn laravel_apps_serve_the_public_directory() {
@@ -425,12 +722,170 @@ mod tests {
 
         assert_eq!(analysis.provider, "php");
         assert_eq!(analysis.metadata["framework"], "laravel");
-        assert_eq!(analysis.metadata["image"], "dunglas/frankenphp:1-php8.2");
+        // `^8.2` admits every published line; the newest settled one wins
+        // over the lower bound.
+        assert_eq!(analysis.metadata["image"], "dunglas/frankenphp:1-php8.4");
         assert_eq!(analysis.metadata["documentRoot"], "/app/public");
+        let start = analysis.plan.deploy.start_command.as_deref().unwrap();
+        assert!(start.ends_with("exec frankenphp run --config /app/Caddyfile"));
+        assert!(start.contains("php artisan migrate --force"));
+        assert!(start.contains("AUTOPACK_NO_MIGRATE"));
+    }
+
+    #[test]
+    fn laravel_apps_get_a_generated_key_and_container_friendly_defaults() {
+        let (_dir, app) = write_app(&[
+            (
+                "composer.json",
+                r#"{"require":{"php":"^8.2","laravel/framework":"^11.0"}}"#,
+            ),
+            ("composer.lock", "{}"),
+            ("artisan", ""),
+            ("public/index.php", "<?php"),
+        ]);
+        let deploy = plan_for(&app).plan.deploy;
+
         assert_eq!(
-            analysis.plan.deploy.start_command.as_deref(),
-            Some("frankenphp run --config /app/Caddyfile")
+            deploy.generated_variables.get("APP_KEY").map(|v| &v.value),
+            Some(&GeneratedValue::PrefixedBase64Secret { bytes: 32 })
         );
+        assert_eq!(
+            deploy.generated_variables.get("APP_URL").map(|v| &v.value),
+            Some(&GeneratedValue::PublicUrl)
+        );
+        assert_eq!(deploy.variables["APP_ENV"], "production");
+        assert_eq!(deploy.variables["LOG_CHANNEL"], "stderr");
+        assert_eq!(deploy.variables["XDG_DATA_HOME"], "/tmp/caddy/data");
+        assert!(!deploy.variables.contains_key("APP_KEY"));
+    }
+
+    #[test]
+    fn laravels_default_sqlite_database_needs_persistent_storage() {
+        let (_dir, app) = write_app(&[
+            (
+                "composer.json",
+                r#"{"require":{"php":"^8.2","laravel/framework":"^11.0"}}"#,
+            ),
+            ("composer.lock", "{}"),
+            ("artisan", ""),
+            ("public/index.php", "<?php"),
+            (
+                "config/database.php",
+                "<?php return ['default' => env('DB_CONNECTION', 'sqlite')];",
+            ),
+        ]);
+        let deploy = plan_for(&app).plan.deploy;
+        assert_eq!(deploy.persistent_paths.len(), 1);
+        assert_eq!(
+            deploy.persistent_paths[0].path,
+            "/app/database/database.sqlite"
+        );
+        assert_eq!(
+            deploy.persistent_paths[0].unless_set,
+            vec!["DB_URL", "DB_HOST"]
+        );
+    }
+
+    #[test]
+    fn a_laravel_app_defaulting_to_mysql_needs_no_persistent_storage() {
+        let (_dir, app) = write_app(&[
+            (
+                "composer.json",
+                r#"{"require":{"php":"^8.2","laravel/framework":"^10.0"}}"#,
+            ),
+            ("composer.lock", "{}"),
+            ("artisan", ""),
+            ("public/index.php", "<?php"),
+            (
+                "config/database.php",
+                "<?php return ['default' => env(\"DB_CONNECTION\", \"mysql\")];",
+            ),
+        ]);
+        assert!(plan_for(&app).plan.deploy.persistent_paths.is_empty());
+    }
+
+    #[test]
+    fn symfony_apps_run_in_prod_with_a_generated_secret() {
+        let (_dir, app) = write_app(&[
+            (
+                "composer.json",
+                r#"{"require":{"php":"^8.2","symfony/framework-bundle":"^7.0"}}"#,
+            ),
+            ("composer.lock", "{}"),
+            ("public/index.php", "<?php"),
+        ]);
+        let analysis = plan_for(&app);
+        assert_eq!(analysis.metadata["framework"], "symfony");
+        let deploy = analysis.plan.deploy;
+        assert_eq!(deploy.variables["APP_ENV"], "prod");
+        assert_eq!(
+            deploy
+                .generated_variables
+                .get("APP_SECRET")
+                .map(|v| &v.value),
+            Some(&GeneratedValue::HexSecret { bytes: 16 })
+        );
+    }
+
+    #[test]
+    fn laravel_front_ends_are_built_after_composer() {
+        let (_dir, app) = write_app(&[
+            (
+                "composer.json",
+                r#"{"require":{"php":"^8.2","laravel/framework":"^11.0"}}"#,
+            ),
+            ("composer.lock", "{}"),
+            ("artisan", ""),
+            ("public/index.php", "<?php"),
+            (
+                "package.json",
+                r#"{"scripts":{"build":"vite build"},"devDependencies":{"vite":"^6.0.0"}}"#,
+            ),
+            ("package-lock.json", "{}"),
+        ]);
+        let analysis = plan_for(&app);
+        let commands: Vec<String> = analysis
+            .plan
+            .step("build")
+            .unwrap()
+            .commands
+            .iter()
+            .map(|command| command.display_name().to_string())
+            .collect();
+
+        let composer = commands
+            .iter()
+            .position(|c| c.starts_with("composer dump-autoload"));
+        let install = commands.iter().position(|c| c == "npm ci");
+        let build = commands.iter().position(|c| c == "npm run build");
+        assert!(composer < install && install < build, "{commands:?}");
+        assert!(analysis.packages.iter().any(|(tool, _)| tool == "node"));
+    }
+
+    #[test]
+    fn php_apps_without_a_package_json_install_no_node() {
+        let (_dir, app) = write_app(&[
+            ("composer.json", r#"{"require":{"php":"^8.3"}}"#),
+            ("composer.lock", "{}"),
+            ("index.php", "<?php"),
+        ]);
+        let analysis = plan_for(&app);
+        assert!(!analysis.packages.iter().any(|(tool, _)| tool == "node"));
+    }
+
+    #[test]
+    fn built_in_extensions_are_not_rebuilt() {
+        let (_dir, app) = write_app(&[
+            (
+                "composer.json",
+                r#"{"require":{"php":"^8.2","ext-json":"*","ext-intl":"*"}}"#,
+            ),
+            ("composer.lock", "{}"),
+            ("index.php", "<?php"),
+        ]);
+        let plan = format!("{:?}", plan_for(&app).plan);
+        assert!(plan.contains("if php -m | grep -qix 'json'"), "{plan}");
+        assert!(plan.contains("if php -m | grep -qix 'intl'"), "{plan}");
     }
 
     #[test]
@@ -468,5 +923,115 @@ mod tests {
             ),
         ]);
         assert_eq!(plan_for(&app).provider, "php");
+    }
+
+    #[test]
+    fn php_ranges_resolve_to_the_newest_published_frankenphp_line() {
+        // `^7.4 || ^8.0` has no FrankenPHP image at 7.4.
+        let (_dir, app) = write_app(&[
+            ("composer.json", r#"{"require":{"php":"^7.4 || ^8.0"}}"#),
+            ("public/index.php", "<?php"),
+        ]);
+        let analysis = plan_for(&app);
+        assert_eq!(analysis.metadata["image"], "dunglas/frankenphp:1-php8.4");
+        assert!(!analysis.metadata.contains_key("configNote1"));
+
+        // Only the newest line admits `^8.5`.
+        let (_dir, app) = write_app(&[
+            ("composer.json", r#"{"require":{"php":"^8.5"}}"#),
+            ("public/index.php", "<?php"),
+        ]);
+        assert_eq!(
+            plan_for(&app).metadata["image"],
+            "dunglas/frankenphp:1-php8.5"
+        );
+    }
+
+    #[test]
+    fn locked_packages_cap_the_php_version() {
+        let lock = r#"{"packages":[
+            {"name":"vendor/old","require":{"php":">=7.2 <8.4"}},
+            {"name":"vendor/any","require":{"php":"^8.1"}}
+        ]}"#;
+        let (_dir, app) = write_app(&[
+            ("composer.json", r#"{"require":{"php":"^8.1"}}"#),
+            ("composer.lock", lock),
+            ("public/index.php", "<?php"),
+        ]);
+        let analysis = plan_for(&app);
+        assert_eq!(analysis.metadata["image"], "dunglas/frankenphp:1-php8.3");
+        assert_eq!(
+            analysis.metadata["phpVersionSource"],
+            "composer.json require.php and composer.lock"
+        );
+    }
+
+    #[test]
+    fn a_lock_no_published_version_satisfies_falls_back_to_the_app_range_with_a_note() {
+        let lock = r#"{"packages":[{"name":"vendor/legacy","require":{"php":"<8.0"}}]}"#;
+        let (_dir, app) = write_app(&[
+            ("composer.json", r#"{"require":{"php":">=8.2"}}"#),
+            ("composer.lock", lock),
+            ("public/index.php", "<?php"),
+        ]);
+        let analysis = plan_for(&app);
+        assert_eq!(analysis.metadata["image"], "dunglas/frankenphp:1-php8.4");
+        assert!(analysis.metadata["configNote1"].contains("vendor/legacy"));
+    }
+
+    #[test]
+    fn a_php_requirement_frankenphp_cannot_meet_uses_the_oldest_published_line() {
+        let (_dir, app) = write_app(&[
+            ("composer.json", r#"{"require":{"php":"^7.4"}}"#),
+            ("index.php", "<?php"),
+        ]);
+        let analysis = plan_for(&app);
+        assert_eq!(analysis.metadata["image"], "dunglas/frankenphp:1-php8.2");
+        assert!(analysis.metadata["configNote1"].contains("^7.4"));
+    }
+
+    #[test]
+    fn heroku_procfile_servers_are_replaced_by_frankenphp() {
+        let (_dir, app) = write_app(&[
+            ("composer.json", r#"{"require":{"php":"^8.2"}}"#),
+            ("Procfile", "web: heroku-php-apache2 web/\n"),
+            ("web/index.php", "<?php"),
+        ]);
+        let analysis = plan_for(&app);
+        assert_eq!(
+            analysis.plan.deploy.start_command.as_deref(),
+            Some("frankenphp run --config /app/Caddyfile")
+        );
+        assert_eq!(analysis.metadata["documentRoot"], "/app/web");
+        assert!(analysis.metadata["configNote1"].contains("heroku-php-apache2"));
+    }
+
+    #[test]
+    fn heroku_php_server_parsing() {
+        use super::heroku_php_server;
+        assert_eq!(
+            heroku_php_server("heroku-php-apache2 web/"),
+            Some(Some("web".to_string()))
+        );
+        assert_eq!(
+            heroku_php_server("vendor/bin/heroku-php-nginx -C nginx.conf public/"),
+            Some(Some("public".to_string()))
+        );
+        assert_eq!(heroku_php_server("heroku-php-apache2"), Some(None));
+        assert_eq!(heroku_php_server("heroku-php-apache2 ../etc"), Some(None));
+        assert_eq!(heroku_php_server("php artisan serve"), None);
+    }
+
+    #[test]
+    fn the_runtime_binary_is_copied_without_its_file_capability() {
+        // A container with every capability dropped refuses to exec a binary
+        // that carries a file capability, so the runtime must replace it with
+        // a plain copy.
+        let (_dir, app) = write_app(&[("index.php", "<?php")]);
+        let analysis = plan_for(&app);
+        let runtime = analysis.plan.step("runtime").expect("a runtime step");
+        assert!(runtime.commands.iter().any(|command| command
+            .display_name()
+            .contains("cp /usr/local/bin/frankenphp /usr/local/bin/frankenphp.autopack")));
     }
 }
