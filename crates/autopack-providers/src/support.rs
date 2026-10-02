@@ -193,6 +193,7 @@ pub fn record_runtime_libraries(binary: &str, record_to: &str) -> String {
 /// emitted by a trusted provider command.
 pub(crate) fn record_runtime_libraries_from_command(binaries: &str, record_to: &str) -> String {
     let record_to = shell_quote(record_to);
+    let apt_update = autopack_core::apt::update_command();
     format!(
         "set -eu; \
          export LC_ALL=C; \
@@ -246,7 +247,7 @@ pub(crate) fn record_runtime_libraries_from_command(binaries: &str, record_to: &
              | cut -d: -f1 | sort -u); \
            if [ -z \"$owners\" ]; then \
              if ! command -v apt-file >/dev/null 2>&1; then \
-               apt-get update >/dev/null; \
+               {apt_update} >/dev/null; \
                apt-get install -y --no-install-recommends -- apt-file >/dev/null; \
                apt-file update >/dev/null; \
              fi; \
@@ -275,6 +276,7 @@ pub(crate) fn record_runtime_libraries_from_command(binaries: &str, record_to: &
 /// Install the packages a previous [`record_runtime_libraries`] call recorded.
 pub fn install_recorded_runtime_libraries(record_to: &str) -> String {
     let record_to = shell_quote(record_to);
+    let apt_update = autopack_core::apt::update_command();
     format!(
         "set -eu; \
          if [ -s {record_to} ]; then \
@@ -290,7 +292,7 @@ pub fn install_recorded_runtime_libraries(record_to: &str) -> String {
                  echo \"autopack: invalid recorded runtime package: $package\" >&2; exit 1 ;; \
              esac; \
            done < {record_to}; \
-           apt-get update; \
+           {apt_update}; \
            apt-get install -y --no-install-recommends -- $(cat {record_to}); \
            rm -rf /var/lib/apt/lists/*; \
          fi"

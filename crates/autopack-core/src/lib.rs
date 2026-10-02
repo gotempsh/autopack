@@ -33,6 +33,7 @@
 #![deny(missing_docs)]
 
 pub mod app;
+pub mod apt;
 pub mod compat;
 pub mod config;
 pub mod env;

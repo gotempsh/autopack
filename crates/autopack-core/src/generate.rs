@@ -535,15 +535,36 @@ impl<'a> BuildContext<'a> {
 ///
 /// `apt-get update` and `install` must share one command: splitting them lets
 /// Docker reuse a stale package index and install versions that no longer exist.
+///
+/// A package written as alternatives (`libffi8|libffi7`) installs the first
+/// one the image's Debian release has. Runtime libraries carry their soname
+/// in the package name, which changes between releases (`libffi7` on
+/// bullseye, `libffi8` on bookworm), and an app's pinned interpreter decides
+/// which release the image is on.
 fn apt_install(packages: &[String]) -> String {
-    let packages = packages
+    let quoted = packages
         .iter()
         .map(|package| shell_quote(package))
         .collect::<Vec<_>>()
         .join(" ");
+    if !packages.iter().any(|package| package.contains('|')) {
+        return format!(
+            "{} && apt-get install -y --no-install-recommends {} && rm -rf /var/lib/apt/lists/*",
+            crate::apt::update_command(),
+            quoted
+        );
+    }
     format!(
-        "apt-get update && apt-get install -y --no-install-recommends {} && rm -rf /var/lib/apt/lists/*",
-        packages
+        "{} && pkgs='' && for alternatives in {}; do \
+           pick=''; \
+           for candidate in $(printf '%s' \"$alternatives\" | tr '|' ' '); do \
+             if apt-cache show \"$candidate\" >/dev/null 2>&1; then pick=\"$candidate\"; break; fi; \
+           done; \
+           if [ -z \"$pick\" ]; then echo \"autopack: no package in '$alternatives' exists on this Debian release\" >&2; exit 1; fi; \
+           pkgs=\"$pkgs $pick\"; \
+         done && apt-get install -y --no-install-recommends $pkgs && rm -rf /var/lib/apt/lists/*",
+        crate::apt::update_command(),
+        quoted
     )
 }
 
@@ -632,7 +653,8 @@ fn is_valid_release(value: &str) -> bool {
 /// Reject any apt package name that is not one, before it reaches a shell.
 fn check_apt_packages(packages: &[String]) -> Result<()> {
     for package in packages {
-        if !is_valid_apt_package(package) {
+        // `a|b` lists alternatives; each one must be a valid name.
+        if !package.split('|').all(is_valid_apt_package) {
             return Err(Error::Provider {
                 provider: "apt".to_string(),
                 message: format!(
@@ -724,8 +746,11 @@ mod tests {
 
         assert_eq!(
             apt_install(&["curl=7.88.1-10".to_string(), "libc6:arm64".to_string()]),
-            "apt-get update && apt-get install -y --no-install-recommends \
-             'curl=7.88.1-10' 'libc6:arm64' && rm -rf /var/lib/apt/lists/*"
+            format!(
+                "{} && apt-get install -y --no-install-recommends \
+                 'curl=7.88.1-10' 'libc6:arm64' && rm -rf /var/lib/apt/lists/*",
+                crate::apt::update_command()
+            )
         );
         assert_eq!(shell_quote("package'name"), "'package'\"'\"'name'");
     }
