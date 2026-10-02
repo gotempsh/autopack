@@ -38,6 +38,7 @@ pub mod shell;
 pub mod staticfile;
 pub mod support;
 pub mod swift;
+pub mod version;
 pub mod zig;
 
 #[cfg(test)]
