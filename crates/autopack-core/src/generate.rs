@@ -80,6 +80,7 @@ pub struct BuildContext<'a> {
     lock: Option<Lock>,
     runtime_base_image: Option<String>,
     runtime_includes_runtimes: bool,
+    image_runtimes: Vec<String>,
     start_command: Option<String>,
     steps: IndexMap<String, Step>,
     caches: IndexMap<String, Cache>,
@@ -89,6 +90,8 @@ pub struct BuildContext<'a> {
     deploy_variables: IndexMap<String, String>,
     deploy_paths: Vec<String>,
     tasks: IndexMap<String, String>,
+    generated_variables: IndexMap<String, crate::plan::GeneratedVariable>,
+    persistent_paths: Vec<crate::plan::PersistentPath>,
 }
 
 impl<'a> BuildContext<'a> {
@@ -113,6 +116,7 @@ impl<'a> BuildContext<'a> {
             lock: None,
             runtime_base_image: env.config("RUNTIME_BASE_IMAGE").map(str::to_string),
             runtime_includes_runtimes: true,
+            image_runtimes: Vec::new(),
             start_command: None,
             steps: IndexMap::new(),
             caches: IndexMap::new(),
@@ -122,6 +126,8 @@ impl<'a> BuildContext<'a> {
             deploy_variables: IndexMap::new(),
             deploy_paths: Vec::new(),
             tasks: IndexMap::new(),
+            generated_variables: IndexMap::new(),
+            persistent_paths: Vec::new(),
         }
     }
 
@@ -251,6 +257,23 @@ impl<'a> BuildContext<'a> {
         self.runtime_includes_runtimes = included;
     }
 
+    /// Declare language runtimes the base image already ships (`erlang` and
+    /// `elixir` in the official Elixir image).
+    ///
+    /// Configured runtimes for these tools are skipped with a note instead of
+    /// being installed with mise on top: two copies of a runtime in one image
+    /// put whichever mise installed first on `PATH`, so tools built by one
+    /// are loaded by the other — Hex compiled for OTP 29 fails to load on the
+    /// image's OTP 26. A legacy `nixpacks.toml` listing `erlang` does exactly
+    /// that, because Nix had no runtime of its own to clash with.
+    pub fn set_base_image_runtimes<I, S>(&mut self, tools: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.image_runtimes = tools.into_iter().map(Into::into).collect();
+    }
+
     /// Whether the runtime image will carry the installed runtimes.
     ///
     /// A provider that adds a runtime package for a mise-installed binary has
@@ -307,9 +330,71 @@ impl<'a> BuildContext<'a> {
         self.tasks.insert(name.into(), command.into());
     }
 
+    /// Declare a variable the app needs and the platform must create when the
+    /// environment does not set it. See [`crate::plan::Deploy::generated_variables`].
+    pub fn require_generated_variable(
+        &mut self,
+        name: impl Into<String>,
+        value: crate::plan::GeneratedValue,
+    ) {
+        self.require_generated_variable_unless(name, value, &[]);
+    }
+
+    /// Like [`Self::require_generated_variable`], but not needed when the
+    /// environment sets any of `unless_set`.
+    pub fn require_generated_variable_unless(
+        &mut self,
+        name: impl Into<String>,
+        value: crate::plan::GeneratedValue,
+        unless_set: &[&str],
+    ) {
+        self.generated_variables.insert(
+            name.into(),
+            crate::plan::GeneratedVariable {
+                value,
+                unless_set: unless_set.iter().map(|name| name.to_string()).collect(),
+            },
+        );
+    }
+
+    /// Declare that the app keeps data at `path` that must outlive the
+    /// container, unless the environment sets any of `unless_set`. See
+    /// [`crate::plan::Deploy::persistent_paths`].
+    pub fn require_persistent_path(
+        &mut self,
+        path: impl Into<String>,
+        reason: impl Into<String>,
+        unless_set: &[&str],
+    ) {
+        let path = path.into();
+        let reason = reason.into();
+        tracing::warn!("autopack: {path} needs persistent storage: {reason}");
+        self.persistent_paths.push(crate::plan::PersistentPath {
+            path,
+            reason,
+            unless_set: unless_set.iter().map(|name| name.to_string()).collect(),
+        });
+    }
+
     /// Record a fact for `autopack info`.
     pub fn add_metadata(&mut self, key: impl Into<String>, value: impl Into<String>) {
         self.metadata.insert(key.into(), value.into());
+    }
+
+    /// Record a decision the user should know about, as the next free
+    /// `configNoteN` entry, and log it as a warning.
+    ///
+    /// For choices autopack made on the app's behalf that change how it
+    /// builds or runs — a translated start command, a version outside the
+    /// requested range — so the build explains itself instead of behaving
+    /// differently for no visible reason.
+    pub fn add_note(&mut self, note: impl Into<String>) {
+        let note = note.into();
+        let index = (1..)
+            .find(|index| !self.metadata.contains_key(&format!("configNote{index}")))
+            .unwrap_or(1);
+        tracing::warn!("{note}");
+        self.metadata.insert(format!("configNote{index}"), note);
     }
 
     /// Assemble the final plan: runtime layer, provider steps, runtime image,
@@ -323,6 +408,14 @@ impl<'a> BuildContext<'a> {
             .map(|(tool, version)| (tool.clone(), version.clone()))
             .collect();
         for (tool, version) in configured {
+            if self.image_runtimes.contains(&tool) {
+                let image = self.base_image.clone();
+                self.add_note(format!(
+                    "configured runtime {tool}@{version} skipped: the base image {image} \
+                     already provides {tool}, and a second copy would conflict with it"
+                ));
+                continue;
+            }
             self.packages.add(tool, version, "autopack.json");
         }
         let apt_packages = self.config.apt_packages.clone();
@@ -387,6 +480,8 @@ impl<'a> BuildContext<'a> {
         plan.deploy.start_command = self.start_command.clone();
         plan.deploy.user = self.runtime_user.clone();
         plan.deploy.tasks = self.tasks.clone();
+        plan.deploy.generated_variables = self.generated_variables.clone();
+        plan.deploy.persistent_paths = self.persistent_paths.clone();
         plan.deploy.variables = self.deploy_variables.clone();
         plan.deploy.paths = self.deploy_paths.clone();
         if runtime_has_packages {
