@@ -43,6 +43,18 @@ const MAX_DEPTH: usize = 8;
 /// Upper bound on indexed paths, so a pathological repo cannot stall detection.
 const MAX_ENTRIES: usize = 50_000;
 
+/// Resolve `relative` under `root`, or `None` when it is missing or escapes `root`.
+///
+/// The source tree is untrusted input. Resolving through the filesystem would
+/// otherwise follow a link such as `package.json -> /etc/passwd`, a directory
+/// link such as `config -> /`, or a `..` path, and read the build host's files
+/// during detection. Links that stay inside the tree still resolve, matching
+/// what the build context will contain. `root` must already be canonical.
+pub(crate) fn resolve_within(root: &Path, relative: &Path) -> Option<PathBuf> {
+    let resolved = root.join(relative).canonicalize().ok()?;
+    resolved.starts_with(root).then_some(resolved)
+}
+
 /// A source directory being analysed.
 pub struct App {
     source: PathBuf,
@@ -80,18 +92,25 @@ impl App {
     }
 
     /// Absolute path for a path relative to the app root.
+    ///
+    /// This only joins the paths: the result may be a symlink that leads out of
+    /// the source tree. Read through [`App::read_file`], which refuses those.
     pub fn path(&self, relative: impl AsRef<Path>) -> PathBuf {
         self.source.join(relative)
     }
 
-    /// True when `relative` exists and is a file.
+    /// True when `relative` exists inside the source tree and is a file.
+    ///
+    /// A symlink or `..` path that leads out of the tree counts as absent.
     pub fn has_file(&self, relative: impl AsRef<Path>) -> bool {
-        self.path(relative).is_file()
+        resolve_within(&self.source, relative.as_ref()).is_some_and(|path| path.is_file())
     }
 
-    /// True when `relative` exists and is a directory.
+    /// True when `relative` exists inside the source tree and is a directory.
+    ///
+    /// A symlink or `..` path that leads out of the tree counts as absent.
     pub fn has_dir(&self, relative: impl AsRef<Path>) -> bool {
-        self.path(relative).is_dir()
+        resolve_within(&self.source, relative.as_ref()).is_some_and(|path| path.is_dir())
     }
 
     /// True when any of `candidates` exists as a file.
@@ -136,12 +155,22 @@ impl App {
     }
 
     /// Read `relative` as UTF-8.
+    ///
+    /// Refuses a symlink or `..` path that leads out of the source tree.
     pub fn read_file(&self, relative: impl AsRef<Path>) -> Result<String> {
         let relative = relative.as_ref();
-        fs::read_to_string(self.path(relative)).map_err(|source| Error::ReadFile {
+        let read_error = |source| Error::ReadFile {
             path: relative.to_path_buf(),
             source,
-        })
+        };
+        let resolved = self.path(relative).canonicalize().map_err(read_error)?;
+        if !resolved.starts_with(&self.source) {
+            return Err(read_error(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "the path leads outside the source directory",
+            )));
+        }
+        fs::read_to_string(resolved).map_err(read_error)
     }
 
     /// Read `relative` as UTF-8, or `None` when it does not exist.
@@ -308,5 +337,60 @@ mod tests {
             .read_json::<serde_json::Value>("package.json")
             .unwrap_err();
         assert!(err.to_string().contains("package.json"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn links_out_of_the_tree_are_never_read() {
+        let dir = fixture(&[("README.md", "")]);
+        let outside = fixture(&[("secret.json", r#"{"name":"SECRET"}"#)]);
+        std::os::unix::fs::symlink(
+            outside.path().join("secret.json"),
+            dir.path().join("package.json"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("config")).unwrap();
+        let app = App::new(dir.path()).unwrap();
+
+        // A file link out of the tree.
+        assert!(!app.has_file("package.json"));
+        assert!(app.read_file("package.json").is_err());
+        assert!(app.read_file_opt("package.json").unwrap().is_none());
+        assert!(app
+            .read_json_opt::<serde_json::Value>("package.json")
+            .unwrap()
+            .is_none());
+
+        // A directory link out of the tree.
+        assert!(!app.has_dir("config"));
+        assert!(!app.has_file("config/secret.json"));
+        assert!(app.read_file("config/secret.json").is_err());
+
+        // A `..` path, with and without a link.
+        let escape = format!(
+            "../{}/secret.json",
+            outside.path().file_name().unwrap().to_string_lossy()
+        );
+        assert!(!app.has_file(&escape));
+        assert!(app.read_file(&escape).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn links_inside_the_tree_still_resolve() {
+        let dir = fixture(&[
+            ("packages/web/package.json", r#"{"name":"web"}"#),
+            ("packages/web/src/index.js", ""),
+        ]);
+        std::os::unix::fs::symlink("packages/web/package.json", dir.path().join("package.json"))
+            .unwrap();
+        std::os::unix::fs::symlink("packages/web/src", dir.path().join("src")).unwrap();
+        let app = App::new(dir.path()).unwrap();
+
+        assert!(app.has_file("package.json"));
+        let value: serde_json::Value = app.read_json("package.json").unwrap();
+        assert_eq!(value["name"], "web");
+        assert!(app.has_dir("src"));
+        assert!(app.has_file("src/index.js"));
     }
 }
