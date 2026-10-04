@@ -168,7 +168,7 @@ impl Provider for NodeProvider {
         }
 
         self.plan_install(ctx, &package, manager, &browsers)?;
-        self.plan_build(ctx, &package, manager, &browsers)?;
+        self.plan_build(ctx, &package, manager, framework, &browsers)?;
 
         let static_site = static_site(ctx, &package, framework);
         // Deferred until the deploy path is known: a static site serves with
@@ -281,13 +281,24 @@ PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD), either unset it or drop the dependency.' >&2;
         ctx: &mut BuildContext<'_>,
         package: &PackageJson,
         manager: PackageManager,
+        framework: Framework,
         browsers: &BrowserTooling,
     ) -> Result<()> {
         let build_script = package
             .script("build")
             .map(|_| manager.run_command("build"));
 
+        // `next build` keeps its compiler and image caches in `.next/cache`
+        // and reuses them on the next build. Without a cache mount that
+        // directory starts empty every time. Locked: concurrent writers can
+        // corrupt it. Being a mount, it also stays out of the image.
+        let next_cache = (framework == Framework::Next && build_script.is_some())
+            .then(|| ctx.locked_cache("next-cache", format!("{APP_DIR}/.next/cache")));
+
         let step = ctx.step(steps::BUILD);
+        if let Some(cache) = next_cache {
+            step.add_cache(cache);
+        }
         step.inputs = vec![Layer::step(steps::INSTALL), Layer::local()];
         // `pnpm run` may re-invoke install for a deps check; same no-TTY rule.
         if manager == PackageManager::Pnpm {
@@ -776,6 +787,35 @@ mod tests {
             Some("next start")
         );
         assert_eq!(analysis.plan.deploy.variables["NODE_ENV"], "production");
+    }
+
+    #[test]
+    fn next_build_reuses_a_locked_next_cache() {
+        let (_dir, app) = write_app(&[(
+            "package.json",
+            r#"{"dependencies":{"next":"15"},"scripts":{"build":"next build","start":"next start"}}"#,
+        )]);
+        let analysis = plan_for(&app);
+
+        let build = analysis.plan.step("build").unwrap();
+        assert!(
+            build.caches.iter().any(|name| name == "next-cache"),
+            "build step caches: {:?}",
+            build.caches
+        );
+        let cache = &analysis.plan.caches["next-cache"];
+        assert_eq!(cache.directory, format!("{APP_DIR}/.next/cache"));
+        assert_eq!(cache.cache_type, autopack_core::plan::CacheType::Locked);
+    }
+
+    #[test]
+    fn non_next_builds_get_no_next_cache() {
+        let (_dir, app) = write_app(&[(
+            "package.json",
+            r#"{"dependencies":{"vite":"5"},"scripts":{"build":"vite build"}}"#,
+        )]);
+        let analysis = plan_for(&app);
+        assert!(!analysis.plan.caches.contains_key("next-cache"));
     }
 
     #[test]
