@@ -42,6 +42,11 @@ pub struct BuildPlan {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub secrets: Vec<String>,
 
+    /// Build argument names the build may be given. Like secrets, only the
+    /// names are part of the plan; the values are supplied at build time.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub build_args: Vec<String>,
+
     /// The runtime image.
     pub deploy: Deploy,
 
@@ -168,6 +173,18 @@ impl BuildPlan {
             }
         }
 
+        // Names are written into the Dockerfile verbatim, so anything beyond
+        // an identifier could end the `ARG` line and start a new instruction.
+        for name in &self.build_args {
+            if !is_build_arg_name(name) {
+                return Err(Error::InvalidPlan(format!(
+                    "build argument `{}` is not a valid name: use letters, digits and \
+                     underscores, not starting with a digit",
+                    name.escape_debug()
+                )));
+            }
+        }
+
         for root in self.deploy.roots() {
             if !seen.contains(root) {
                 return Err(Error::InvalidPlan(format!(
@@ -245,6 +262,15 @@ impl BuildPlan {
     }
 }
 
+/// True when `name` is a variable name a Dockerfile `ARG` can declare.
+fn is_build_arg_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -315,6 +341,24 @@ mod tests {
 
         let err = plan.validate().unwrap_err();
         assert!(err.to_string().contains("unknown step `missing`"), "{err}");
+    }
+
+    #[test]
+    fn build_arg_names_must_be_identifiers() {
+        for valid in ["VITE_API_URL", "_private", "a1"] {
+            let mut plan = plan_with_chain();
+            plan.build_args = vec![valid.into()];
+            assert!(plan.validate().is_ok(), "{valid}");
+        }
+        for invalid in ["", "1ABC", "A-B", "A B", "A\nRUN id", "A=1"] {
+            let mut plan = plan_with_chain();
+            plan.build_args = vec![invalid.into()];
+            let err = plan.validate().unwrap_err();
+            assert!(
+                err.to_string().contains("not a valid name"),
+                "{invalid}: {err}"
+            );
+        }
     }
 
     #[test]

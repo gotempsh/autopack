@@ -122,6 +122,7 @@ impl RailpackConfig {
                     inputs: step.inputs.clone(),
                     commands: step.commands.clone(),
                     secrets: step.secrets.clone(),
+                    build_args: None,
                     assets: step.assets.clone(),
                     variables: step.variables.clone(),
                     caches: step.caches.clone(),

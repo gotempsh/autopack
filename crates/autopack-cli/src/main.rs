@@ -107,6 +107,12 @@ struct CommonArgs {
     #[arg(long = "secret", value_name = "NAME")]
     secrets: Vec<String>,
 
+    /// Name of a build argument the build step reads, such as `VITE_API_URL`.
+    /// Its value is read from the environment variable of the same name. For
+    /// values the app is meant to contain; pass credentials with `--secret`.
+    #[arg(long = "build-arg", value_name = "NAME")]
+    build_args: Vec<String>,
+
     /// Extra `KEY=VALUE` build variable, repeatable.
     #[arg(long = "env", value_name = "KEY=VALUE")]
     env: Vec<String>,
@@ -316,6 +322,9 @@ fn analyse(common: &CommonArgs) -> Result<Analysis> {
     for secret in &common.secrets {
         env.add_secret(secret);
     }
+    for name in &common.build_args {
+        env.add_build_arg(name);
+    }
 
     Ok(analyze(&app, &env, &autopack_providers::registry())?)
 }
@@ -453,6 +462,19 @@ fn build(
         }
         args.push("--secret".into());
         args.push(format!("id={secret},env={secret}"));
+    }
+
+    for name in &analysis.plan.build_args {
+        if std::env::var_os(name).is_none() {
+            eprintln!(
+                "warning: build argument `{name}` was requested but is not set in the environment"
+            );
+            continue;
+        }
+        // Without `=VALUE`, docker reads the value from its own environment,
+        // so it never appears on the command line or in `--dry-run` output.
+        args.push("--build-arg".into());
+        args.push(name.clone());
     }
 
     args.push(context_path.display().to_string());
