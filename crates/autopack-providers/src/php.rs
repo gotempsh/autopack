@@ -300,6 +300,11 @@ impl Provider for PhpProvider {
             _ => {}
         }
 
+        // The generated Caddyfile disables the admin API, so FrankenPHP's
+        // inherited localhost:2019/metrics probe cannot work. Readiness is
+        // owned by the host; keeping this probe reports healthy apps unhealthy.
+        ctx.set_healthcheck(autopack_core::plan::Healthcheck::Disabled);
+
         // The official image's binary carries a `cap_net_bind_service` file
         // capability so it can bind :80. A container started with every
         // capability dropped refuses to exec a binary whose file capabilities

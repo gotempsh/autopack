@@ -15,7 +15,9 @@ mod step;
 
 pub use cache::{Cache, CacheType};
 pub use command::{Command, CopyCommand, ExecCommand, FileCommand, PathCommand};
-pub use deploy::{Deploy, GeneratedValue, GeneratedVariable, PersistentPath, RuntimeUser};
+pub use deploy::{
+    Deploy, GeneratedValue, GeneratedVariable, Healthcheck, PersistentPath, RuntimeUser,
+};
 pub use filter::Filter;
 pub use layer::{Layer, LayerSource};
 pub use step::Step;

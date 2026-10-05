@@ -32,6 +32,10 @@ pub struct Deploy {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub paths: Vec<String>,
 
+    /// Whether to inherit the runtime base image's health probe.
+    #[serde(default, skip_serializing_if = "Healthcheck::is_inherited")]
+    pub healthcheck: Healthcheck,
+
     /// User the container runs as. `None` means root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<RuntimeUser>,
@@ -73,6 +77,23 @@ pub struct Deploy {
         rename = "persistentPaths"
     )]
     pub persistent_paths: Vec<PersistentPath>,
+}
+
+/// Policy for a health probe supplied by the runtime base image.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Healthcheck {
+    /// Keep the base image's health probe, if one exists.
+    #[default]
+    Inherit,
+    /// Remove the base image's probe; the host owns readiness checks.
+    Disabled,
+}
+
+impl Healthcheck {
+    fn is_inherited(&self) -> bool {
+        matches!(self, Self::Inherit)
+    }
 }
 
 /// One entry of [`Deploy::persistent_paths`].
@@ -178,6 +199,22 @@ impl Deploy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn absent_health_policy_preserves_existing_plans() {
+        let deploy: Deploy = serde_json::from_str("{}").unwrap();
+        assert_eq!(deploy.healthcheck, Healthcheck::Inherit);
+        assert!(serde_json::to_value(&deploy)
+            .unwrap()
+            .get("healthcheck")
+            .is_none());
+        let disabled: Deploy = serde_json::from_str(r#"{"healthcheck":"disabled"}"#).unwrap();
+        assert_eq!(disabled.healthcheck, Healthcheck::Disabled);
+        assert_eq!(
+            serde_json::to_value(&disabled).unwrap()["healthcheck"],
+            "disabled"
+        );
+    }
 
     #[test]
     fn generated_variables_serialise_flat_with_optional_alternatives() {

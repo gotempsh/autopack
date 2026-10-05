@@ -116,6 +116,10 @@ pub struct DeployPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inputs: Option<Vec<Layer>>,
 
+    /// Replaces the policy for an inherited base-image health probe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub healthcheck: Option<crate::plan::Healthcheck>,
+
     /// Replaces the container start command.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub start_command: Option<String>,
@@ -303,6 +307,9 @@ impl DeployPatch {
         if let Some(inputs) = &self.inputs {
             plan.deploy.inputs = inputs.clone();
         }
+        if let Some(healthcheck) = self.healthcheck {
+            plan.deploy.healthcheck = healthcheck;
+        }
         if let Some(start) = &self.start_command {
             plan.deploy.start_command = Some(start.clone());
         }
@@ -351,6 +358,26 @@ mod tests {
             ..Default::default()
         };
         plan
+    }
+
+    #[test]
+    fn health_policy_can_be_overridden_without_resetting_other_deploy_fields() {
+        let mut plan = plan_with_build();
+        for (json, expected) in [
+            (
+                r#"{"deploy":{"healthcheck":"disabled"}}"#,
+                crate::plan::Healthcheck::Disabled,
+            ),
+            (
+                r#"{"deploy":{"healthcheck":"inherit"}}"#,
+                crate::plan::Healthcheck::Inherit,
+            ),
+        ] {
+            let config: Config = serde_json::from_str(json).unwrap();
+            config.apply(&mut plan);
+            assert_eq!(plan.deploy.healthcheck, expected);
+            assert_eq!(plan.deploy.start_command.as_deref(), Some("npm start"));
+        }
     }
 
     #[test]

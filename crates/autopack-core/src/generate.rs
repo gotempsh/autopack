@@ -82,6 +82,7 @@ pub struct BuildContext<'a> {
     runtime_includes_runtimes: bool,
     image_runtimes: Vec<String>,
     start_command: Option<String>,
+    healthcheck: crate::plan::Healthcheck,
     steps: IndexMap<String, Step>,
     caches: IndexMap<String, Cache>,
     deploy_inputs: Vec<Layer>,
@@ -118,6 +119,7 @@ impl<'a> BuildContext<'a> {
             runtime_includes_runtimes: true,
             image_runtimes: Vec::new(),
             start_command: None,
+            healthcheck: crate::plan::Healthcheck::Inherit,
             steps: IndexMap::new(),
             caches: IndexMap::new(),
             deploy_inputs: Vec::new(),
@@ -286,6 +288,11 @@ impl<'a> BuildContext<'a> {
     /// Set the command the container runs.
     pub fn set_start_command(&mut self, command: impl Into<String>) {
         self.start_command = Some(command.into());
+    }
+
+    /// Choose whether the runtime inherits its base image's health probe.
+    pub fn set_healthcheck(&mut self, policy: crate::plan::Healthcheck) {
+        self.healthcheck = policy;
     }
 
     /// The start command set so far.
@@ -502,6 +509,7 @@ impl<'a> BuildContext<'a> {
         };
         plan.deploy.start_command = self.start_command.clone();
         plan.deploy.user = self.runtime_user.clone();
+        plan.deploy.healthcheck = self.healthcheck;
         plan.deploy.tasks = self.tasks.clone();
         plan.deploy.generated_variables = self.generated_variables.clone();
         plan.deploy.persistent_paths = self.persistent_paths.clone();
