@@ -92,6 +92,11 @@ impl Provider for ElixirProvider {
         ctx.add_deploy_variable("MIX_ENV", "prod");
         ctx.add_deploy_variable("LANG", "C.UTF-8");
         if builds_release {
+            // Keep the matching slim image's system libraries, but a release
+            // bundles its own ERTS and never needs the Elixir/Mix toolchain.
+            ctx.add_runtime_command(Command::shell(
+                "rm -rf /usr/local/lib/elixir && rm -f /usr/local/bin/elixir /usr/local/bin/elixirc /usr/local/bin/mix /usr/local/bin/iex",
+            ));
             ctx.add_deploy_input(Layer::step(steps::BUILD).including([RELEASE_DIR]));
             // Releases refuse to boot without a cookie; a stable one avoids a
             // different value on every restart breaking clustering.
@@ -410,6 +415,8 @@ end
         let plan = plan_for(&app).plan;
 
         assert_eq!(plan.deploy.start_command.as_deref(), Some("mix phx.server"));
+        assert!(!format!("{:?}", plan.step("runtime").unwrap().commands)
+            .contains("rm -rf /usr/local/lib/elixir"));
         assert_eq!(plan.deploy.variables["MIX_HOME"], "/app/.mix");
         let inputs = format!("{:?}", plan.deploy.inputs);
         assert!(!inputs.contains("/app/release"), "{inputs}");
@@ -526,6 +533,15 @@ end
                 .as_deref(),
             Some("elixir:1.18-slim")
         );
+    }
+
+    #[test]
+    fn release_runtime_removes_elixir_tools() {
+        let (_dir, app) = write_app(&[("mix.exs", MIX_EXS)]);
+        let analysis = plan_for(&app);
+        let commands = format!("{:?}", analysis.plan.step("runtime").unwrap().commands);
+        assert!(commands.contains("rm -rf /usr/local/lib/elixir"));
+        assert!(commands.contains("/usr/local/bin/mix"));
     }
 
     #[test]

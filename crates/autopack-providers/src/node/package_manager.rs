@@ -240,7 +240,16 @@ impl PackageManager {
     pub fn cache(self) -> (&'static str, Vec<(&'static str, &'static str)>) {
         match self {
             Self::Npm => ("/cache/npm", vec![("npm_config_cache", "/cache/npm")]),
-            Self::Pnpm => ("/cache/pnpm", vec![("npm_config_store_dir", "/cache/pnpm")]),
+            // pnpm 10 and earlier read `npm_config_*`; pnpm 11 reads only
+            // `pnpm_config_*`. Each ignores the other, so set both or pnpm 11
+            // keeps its store outside the cache mount and re-downloads.
+            Self::Pnpm => (
+                "/cache/pnpm",
+                vec![
+                    ("npm_config_store_dir", "/cache/pnpm"),
+                    ("pnpm_config_store_dir", "/cache/pnpm"),
+                ],
+            ),
             Self::Yarn => ("/cache/yarn", vec![("YARN_CACHE_FOLDER", "/cache/yarn")]),
             Self::YarnBerry => (
                 "/cache/yarn",
@@ -389,6 +398,21 @@ mod tests {
                 PackageManager::Pnpm.install_command(&app, &package, None),
                 "pnpm install --frozen-lockfile",
                 "{pin}"
+            );
+        }
+    }
+
+    #[test]
+    fn pnpm_store_is_pointed_at_the_cache_for_every_major() {
+        // pnpm <= 10 reads npm_config_store_dir and pnpm 11 reads only
+        // pnpm_config_store_dir; with just one set, the other major keeps its
+        // store outside the cache mount and downloads every package again.
+        let (directory, variables) = PackageManager::Pnpm.cache();
+        assert_eq!(directory, "/cache/pnpm");
+        for key in ["npm_config_store_dir", "pnpm_config_store_dir"] {
+            assert!(
+                variables.contains(&(key, "/cache/pnpm")),
+                "{key} missing from {variables:?}"
             );
         }
     }
