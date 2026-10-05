@@ -49,12 +49,17 @@ const MAX_ENTRIES: usize = 50_000;
 /// all source operations use this directory capability, not its old pathname.
 fn open_source_directory(source: &Path) -> std::io::Result<cap_std::fs::Dir> {
     use cap_fs_ext::DirExt;
-    if let (Some(parent), Some(name)) = (source.parent(), source.file_name()) {
-        let parent = cap_std::fs::Dir::open_ambient_dir(parent, cap_std::ambient_authority())?;
-        parent.open_dir_nofollow(name)
-    } else {
-        cap_std::fs::Dir::open_ambient_dir(source, cap_std::ambient_authority())
+    let root = source.ancestors().last().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "source has no filesystem root",
+        )
+    })?;
+    let mut directory = cap_std::fs::Dir::open_ambient_dir(root, cap_std::ambient_authority())?;
+    for component in source.strip_prefix(root).unwrap().components() {
+        directory = directory.open_dir_nofollow(component.as_os_str())?;
     }
+    Ok(directory)
 }
 
 /// A source directory being analysed.
@@ -247,7 +252,6 @@ impl App {
         let mut files = Vec::new();
 
         let mut pending = vec![(PathBuf::new(), 0)];
-        let mut visited = 0;
         'walk: while let Some((directory, depth)) = pending.pop() {
             let path = if directory.as_os_str().is_empty() {
                 Path::new(".")
@@ -258,20 +262,19 @@ impl App {
                 continue;
             };
             for entry in entries.filter_map(std::result::Result::ok) {
-                visited += 1;
-                if visited > MAX_ENTRIES {
-                    tracing::warn!(
-                        limit = MAX_ENTRIES,
-                        "source indexing reached its entry bound"
-                    );
-                    break 'walk;
-                }
                 let name = entry.file_name();
                 let relative = directory.join(&name);
                 let Ok(kind) = entry.file_type() else {
                     continue;
                 };
                 if kind.is_file() {
+                    if files.len() >= MAX_ENTRIES {
+                        tracing::warn!(
+                            limit = MAX_ENTRIES,
+                            "source indexing reached its file bound"
+                        );
+                        break 'walk;
+                    }
                     files.push(
                         relative
                             .components()
@@ -305,6 +308,40 @@ mod tests {
             fs::write(full, contents).unwrap();
         }
         dir
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ancestor_entry_swapped_for_a_symlink_cannot_acquire_a_capability() {
+        let parent = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        fs::create_dir_all(parent.path().join("ancestor/source")).unwrap();
+        fs::create_dir(external.path().join("source")).unwrap();
+        let canonical = parent
+            .path()
+            .join("ancestor/source")
+            .canonicalize()
+            .unwrap();
+        fs::rename(parent.path().join("ancestor"), parent.path().join("parked")).unwrap();
+        std::os::unix::fs::symlink(external.path(), parent.path().join("ancestor")).unwrap();
+        assert!(super::open_source_directory(&canonical).is_err());
+    }
+
+    #[test]
+    fn empty_directories_do_not_consume_the_file_index_limit() {
+        let root = tempfile::tempdir().unwrap();
+        for i in 0..=super::MAX_ENTRIES {
+            fs::create_dir(root.path().join(format!("empty-{i}"))).unwrap();
+        }
+        fs::create_dir(root.path().join("project")).unwrap();
+        fs::write(root.path().join("project/manifest.csproj"), "").unwrap();
+        assert_eq!(
+            App::new(root.path())
+                .unwrap()
+                .find_files("**/*.csproj")
+                .unwrap(),
+            ["project/manifest.csproj"]
+        );
     }
 
     #[cfg(unix)]
