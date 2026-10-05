@@ -103,7 +103,9 @@ than shelling out to a binary:
   declares `ARG VITE_API_URL` in the build step; the host supplies the value
   with `--build-arg VITE_API_URL=...`. Use them for values the build inlines
   into the app, not credentials: unlike a secret, a build argument a `RUN`
-  reads is recorded in the image history.
+  reads is recorded in the image history. `plan.build_args` also lists names
+  the app's `autopack.json` requests, so supply values only for names your
+  platform chose to grant, never every name in the plan.
 - **The `.dockerignore` is separate.** `to_dockerignore(&plan)` returns it.
   BuildKit reads `<dockerfile-name>.dockerignore` from the Dockerfile's
   directory, so writing both to a temp dir and passing `-f` keeps the user's

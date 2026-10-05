@@ -464,18 +464,14 @@ fn build(
         args.push(format!("id={secret},env={secret}"));
     }
 
-    for name in &analysis.plan.build_args {
-        if std::env::var_os(name).is_none() {
-            eprintln!(
-                "warning: build argument `{name}` was requested but is not set in the environment"
-            );
-            continue;
-        }
-        // Without `=VALUE`, docker reads the value from its own environment,
-        // so it never appears on the command line or in `--dry-run` output.
-        args.push("--build-arg".into());
-        args.push(name.clone());
+    let (build_arg_args, warnings) =
+        build_arg_flags(&analysis.plan.build_args, &common.build_args, |name| {
+            std::env::var_os(name).is_some()
+        });
+    for warning in warnings {
+        eprintln!("warning: {warning}");
     }
+    args.extend(build_arg_args);
 
     args.push(context_path.display().to_string());
 
@@ -506,4 +502,92 @@ fn build(
         eprintln!("built {tag}");
     }
     Ok(())
+}
+
+/// The `--build-arg` flags for a build, and a warning for each requested name
+/// that gets no value.
+///
+/// Only names the operator granted with `--build-arg` are forwarded. The plan
+/// also lists names an app's `autopack.json` requests, and forwarding those
+/// from this process's environment would let a repository read any host
+/// variable it can name, such as a cloud credential, in its build commands.
+///
+/// Each flag is the bare name: without `=VALUE`, docker reads the value from
+/// its own environment, so it never appears on the command line or in
+/// `--dry-run` output.
+fn build_arg_flags(
+    requested: &[String],
+    granted: &[String],
+    is_set: impl Fn(&str) -> bool,
+) -> (Vec<String>, Vec<String>) {
+    let mut args = Vec::new();
+    let mut warnings = Vec::new();
+    for name in requested {
+        if !granted.contains(name) {
+            warnings.push(format!(
+                "build argument `{name}` is requested by the app's configuration but was not \
+                 granted, so the build gets no value for it; pass `--build-arg {name}` to \
+                 forward it"
+            ));
+            continue;
+        }
+        if !is_set(name) {
+            warnings.push(format!(
+                "build argument `{name}` was requested but is not set in the environment"
+            ));
+            continue;
+        }
+        args.push("--build-arg".to_string());
+        args.push(name.clone());
+    }
+    (args, warnings)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn names(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[test]
+    fn only_granted_build_args_are_forwarded() {
+        // The app's config asks for a host credential; the operator granted
+        // only the public value.
+        let requested = names(&["VITE_API_URL", "AWS_SECRET_ACCESS_KEY"]);
+        let granted = names(&["VITE_API_URL"]);
+
+        let (args, warnings) = build_arg_flags(&requested, &granted, |_| true);
+
+        assert_eq!(args, names(&["--build-arg", "VITE_API_URL"]));
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0].contains("`AWS_SECRET_ACCESS_KEY` is requested by the app's configuration"),
+            "{warnings:?}"
+        );
+        assert!(warnings[0].contains("--build-arg AWS_SECRET_ACCESS_KEY"));
+    }
+
+    #[test]
+    fn a_granted_build_arg_without_a_value_is_skipped_with_a_warning() {
+        let requested = names(&["VITE_API_URL"]);
+
+        let (args, warnings) = build_arg_flags(&requested, &requested, |_| false);
+
+        assert!(args.is_empty());
+        assert_eq!(
+            warnings,
+            ["build argument `VITE_API_URL` was requested but is not set in the environment"]
+        );
+    }
+
+    #[test]
+    fn build_arg_flags_never_carry_a_value() {
+        let requested = names(&["VITE_API_URL"]);
+
+        let (args, _) = build_arg_flags(&requested, &requested, |_| true);
+
+        assert!(args.iter().all(|arg| !arg.contains('=')), "{args:?}");
+    }
 }

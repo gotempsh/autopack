@@ -185,6 +185,22 @@ impl BuildPlan {
             }
         }
 
+        // A step can only declare names the plan declares: the backend would
+        // otherwise have nothing to emit for it, and the build would run
+        // without a value the step expects.
+        for step in &self.steps {
+            for name in &step.build_args {
+                if name != "*" && !self.build_args.contains(name) {
+                    return Err(Error::InvalidPlan(format!(
+                        "step `{}` declares build argument `{}`, which the plan does not; \
+                         add it to the top-level `buildArgs` or remove it from the step",
+                        step.name,
+                        name.escape_debug()
+                    )));
+                }
+            }
+        }
+
         for root in self.deploy.roots() {
             if !seen.contains(root) {
                 return Err(Error::InvalidPlan(format!(
@@ -359,6 +375,22 @@ mod tests {
                 "{invalid}: {err}"
             );
         }
+    }
+
+    #[test]
+    fn a_step_cannot_declare_a_build_arg_the_plan_does_not() {
+        let mut plan = plan_with_chain();
+        plan.build_args = vec!["DECLARED".into()];
+        let step = plan.steps.last_mut().unwrap();
+        step.build_args = vec!["DECLARED".into(), "PUBLIC_URL".into()];
+        let err = plan.validate().unwrap_err().to_string();
+        assert!(err.contains("build argument `PUBLIC_URL`"), "{err}");
+        assert!(err.contains("top-level `buildArgs`"), "{err}");
+
+        plan.steps.last_mut().unwrap().build_args = vec!["DECLARED".into()];
+        plan.validate().unwrap();
+        plan.steps.last_mut().unwrap().build_args = vec!["*".into()];
+        plan.validate().unwrap();
     }
 
     #[test]

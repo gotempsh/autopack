@@ -372,6 +372,11 @@ a changed value re-runs the build but not the install. A step's `buildArgs`
 moves or removes them. A build argument a `RUN` reads is recorded in that
 stage's image history, so never pass a credential this way; use a secret.
 
+`buildArgs` in `autopack.json` only *declares* names. The CLI forwards a value
+only for names you grant with `--build-arg`, and warns about any other name the
+configuration requests, so a repository cannot read a host variable just by
+naming it.
+
 ## Tasks
 
 A `Procfile` declares named processes. `web` becomes the container's start

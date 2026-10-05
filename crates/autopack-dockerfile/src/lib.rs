@@ -429,19 +429,14 @@ fn secret_names(plan: &BuildPlan, step: &Step) -> Vec<String> {
 
 /// The build arguments a step declares, with `*` expanded to the plan's list.
 ///
-/// Only names the plan declares are emitted: `validate` has checked those are
-/// identifiers, and a step-level name is app-controlled config.
+/// `validate` has checked that every name is an identifier the plan declares,
+/// so each one is emitted as written.
 fn build_arg_names(plan: &BuildPlan, step: &Step) -> Vec<String> {
     if step.uses_all_build_args() {
-        return plan.build_args.clone();
+        plan.build_args.clone()
+    } else {
+        step.build_args.clone()
     }
-
-    let declared: BTreeSet<&String> = plan.build_args.iter().collect();
-    step.build_args
-        .iter()
-        .filter(|name| declared.contains(name))
-        .cloned()
-        .collect()
 }
 
 /// Collapse a string onto a single line for use inside a `#` comment.
@@ -706,8 +701,7 @@ mod tests {
         let mut build = Step::new("build");
         build.add_input(Layer::image("alpine"));
         build.add_command(Command::shell("./build.sh"));
-        // `UNDECLARED` is not in the plan, so it has no value to receive.
-        build.build_args = vec!["PUBLIC_URL".into(), "UNDECLARED".into()];
+        build.build_args = vec!["PUBLIC_URL".into()];
         plan.add_step(build);
         plan.deploy = Deploy {
             base: Layer::step("build"),
@@ -721,7 +715,11 @@ mod tests {
             "{dockerfile}"
         );
         assert!(!dockerfile.contains("ARG OTHER"), "{dockerfile}");
-        assert!(!dockerfile.contains("ARG UNDECLARED"), "{dockerfile}");
+
+        // A name the plan does not declare is an error, not a silent no-op.
+        plan.steps[0].build_args.push("UNDECLARED".into());
+        let err = to_dockerfile(&plan).unwrap_err().to_string();
+        assert!(err.contains("build argument `UNDECLARED`"), "{err}");
     }
 
     #[test]
