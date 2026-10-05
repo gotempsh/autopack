@@ -12,7 +12,7 @@
 use indexmap::IndexMap;
 use serde::Deserialize;
 
-use crate::config::{Config, DeployPatch, StepPatch};
+use crate::config::{Config, DeployPatch, StepPatch, SPREAD};
 use crate::plan::Command;
 use crate::steps;
 
@@ -118,7 +118,22 @@ impl NixpacksConfig {
             config.steps.insert(
                 step.to_string(),
                 StepPatch {
-                    commands: Some(phase.cmds.iter().map(Command::shell).collect()),
+                    // Nixpacks' `"..."` keeps the generated commands, the
+                    // same marker autopack config uses; wrapping it in a
+                    // shell would run a command named `...` instead.
+                    commands: Some(
+                        phase
+                            .cmds
+                            .iter()
+                            .map(|cmd| {
+                                if cmd.trim() == SPREAD {
+                                    Command::exec(SPREAD)
+                                } else {
+                                    Command::shell(cmd)
+                                }
+                            })
+                            .collect(),
+                    ),
                     ..Default::default()
                 },
             );
@@ -272,6 +287,14 @@ mod tests {
             config.steps["build"].commands.as_ref().unwrap()[0].display_name(),
             "npm run build"
         );
+    }
+
+    #[test]
+    fn the_spread_marker_keeps_the_generated_commands() {
+        let (config, _) = parse("[phases.build]\ncmds = [\"...\", \"make docs\"]\n");
+        let commands = config.steps["build"].commands.as_ref().unwrap();
+        assert_eq!(commands[0], Command::exec(SPREAD));
+        assert_eq!(commands[1].display_name(), "make docs");
     }
 
     #[test]

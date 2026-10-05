@@ -154,7 +154,9 @@ pub const RUBY: &[NativeDependency] = &[
     NativeDependency {
         package: "ffi",
         build: &["libffi-dev"],
-        runtime: &["libffi8"],
+        // The soname is in the package name and differs by Debian release;
+        // a pinned Ruby patch can land on any of them.
+        runtime: &["libffi8|libffi7|libffi6"],
     },
     // Nokogiri vendors and statically links its own libxml2, so only the
     // source-build path needs headers and the runtime needs nothing.
@@ -171,7 +173,7 @@ pub const RUBY: &[NativeDependency] = &[
     NativeDependency {
         package: "charlock_holmes",
         build: &["libicu-dev"],
-        runtime: &["libicu72"],
+        runtime: &["libicu76|libicu72|libicu67|libicu63"],
     },
     NativeDependency {
         package: "curb",

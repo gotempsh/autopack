@@ -287,6 +287,8 @@ PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD), either unset it or drop the dependency.' >&2;
         let build_script = package
             .script("build")
             .map(|_| manager.run_command("build"));
+        let (node_version, _) = node_version(ctx.app, package)?;
+        let legacy_openssl = needs_legacy_openssl(package, &node_version);
 
         // Cache each Next package at its own build directory, including root
         // scripts that delegate to workspace apps. Scope locks to the source
@@ -332,6 +334,9 @@ PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD), either unset it or drop the dependency.' >&2;
             step.add_cache(cache);
         }
         step.inputs = vec![Layer::step(steps::INSTALL), Layer::local()];
+        if legacy_openssl {
+            step.add_variable("NODE_OPTIONS", LEGACY_OPENSSL_OPTION);
+        }
         // `pnpm run` may re-invoke install for a deps check; same no-TTY rule.
         if manager == PackageManager::Pnpm {
             step.add_variable("CI", "true");
@@ -554,6 +559,102 @@ fn static_site(
     }
 }
 
+/// What a non-Node provider learns from [`plan_front_end`].
+pub(crate) struct FrontEnd {
+    /// The package manager the app uses.
+    pub(crate) manager: PackageManager,
+    /// Whether `package.json` defines a `build` script.
+    pub(crate) has_build_script: bool,
+}
+
+/// Install Node, the app's package manager and its JavaScript dependencies in
+/// `step_name`, for an app another provider builds.
+///
+/// Server frameworks compile their front end with Node during their own build
+/// — Laravel through Vite or Mix, Rails through jsbundling, cssbundling or
+/// Webpacker — and all of it fails without `node` and `node_modules`. The
+/// commands are added to the step before the provider's own, so the
+/// dependencies are in place when its asset task runs. Returns `None` when the
+/// app has no `package.json`.
+pub(crate) fn plan_front_end(
+    ctx: &mut BuildContext<'_>,
+    step_name: &str,
+) -> Result<Option<FrontEnd>> {
+    let Some(package) = ctx.app.read_json_opt::<PackageJson>("package.json")? else {
+        return Ok(None);
+    };
+    let manager = PackageManager::detect(ctx.app, &package);
+    let (node_version, version_source) = node_version(ctx.app, &package)?;
+    ctx.packages.add("node", &node_version, version_source);
+    if let Some((tool, version)) = manager.mise_tool(&package) {
+        ctx.packages.add(tool, version, "packageManager / lockfile");
+    }
+    if manager.needs_libatomic(&package, ctx.lock()) {
+        ctx.build_apt_packages.push("libatomic1".to_string());
+    }
+    ctx.add_metadata("frontEnd", manager.id());
+    ctx.add_metadata("nodeVersion", &node_version);
+
+    let install = manager.install_command(ctx.app, &package, ctx.lock());
+    let legacy_openssl = needs_legacy_openssl(&package, &node_version);
+    let (cache_dir, cache_env) = manager.cache();
+    let cache = ctx.shared_cache(format!("{}-store", manager.id()), cache_dir);
+
+    let step = ctx.step(step_name);
+    step.add_cache(cache);
+    for (key, value) in cache_env {
+        step.add_variable(key, value);
+    }
+    if manager == PackageManager::Pnpm {
+        // Docker RUN has no TTY; pnpm prompts to purge node_modules otherwise.
+        step.add_variable("CI", "true");
+    }
+    if legacy_openssl {
+        step.add_variable("NODE_OPTIONS", LEGACY_OPENSSL_OPTION);
+    }
+    step.add_command(Command::shell(install));
+
+    Ok(Some(FrontEnd {
+        manager,
+        has_build_script: package.script("build").is_some(),
+    }))
+}
+
+/// Lets webpack 4 hash with MD4 on Node 17+, whose OpenSSL 3 dropped it.
+const LEGACY_OPENSSL_OPTION: &str = "--openssl-legacy-provider";
+
+/// Whether the build runs webpack 4 on a Node new enough to need
+/// [`LEGACY_OPENSSL_OPTION`].
+///
+/// Webpack 4 hashes modules with MD4, which OpenSSL 3 (Node 17+) no longer
+/// provides; the build dies with `ERR_OSSL_EVP_UNSUPPORTED`. It arrives
+/// directly or through the toolchains built on it: Webpacker 5 and older,
+/// Create React App 4, Vue CLI 4 and Laravel Mix 5. Node 16 and older reject
+/// the flag outright, so it is only set when the Node being installed has it.
+fn needs_legacy_openssl(package: &PackageJson, node_version: &str) -> bool {
+    let major = |name: &str| {
+        package
+            .dependencies
+            .get(name)
+            .or_else(|| package.dev_dependencies.get(name))
+            .and_then(|range| {
+                crate::version::Version::parse(
+                    range.trim_start_matches(|c: char| !c.is_ascii_digit()),
+                )
+            })
+            .map(|version| version.major)
+    };
+    let webpack4 = major("webpack").is_some_and(|m| m <= 4)
+        || major("@rails/webpacker").is_some_and(|m| m <= 5)
+        || major("react-scripts").is_some_and(|m| m <= 4)
+        || major("@vue/cli-service").is_some_and(|m| m <= 4)
+        || major("laravel-mix").is_some_and(|m| m <= 5);
+    // An alias (`lts`, `latest`) is always a current release.
+    let modern_node =
+        crate::version::Version::parse(node_version).is_none_or(|version| version.major >= 17);
+    webpack4 && modern_node
+}
+
 /// The Node version to install, and where it was found.
 fn node_version(app: &App, package: &PackageJson) -> Result<(String, String)> {
     for file in [".nvmrc", ".node-version"] {
@@ -708,9 +809,61 @@ fn is_simple_command(script: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{PLAYWRIGHT_BROWSERS, RUNTIME_DEPS_FILE};
+    use super::{needs_legacy_openssl, PackageJson, PLAYWRIGHT_BROWSERS, RUNTIME_DEPS_FILE};
     use crate::test_support::{plan_for, plan_with_env, write_app};
     use autopack_core::APP_DIR;
+
+    #[test]
+    fn webpack_4_toolchains_get_the_legacy_openssl_provider_on_modern_node() {
+        let package = |deps: &str| -> PackageJson {
+            serde_json::from_str(&format!(r#"{{"dependencies":{{{deps}}}}}"#)).unwrap()
+        };
+        assert!(needs_legacy_openssl(
+            &package(r#""react-scripts":"4.0.3""#),
+            "24"
+        ));
+        assert!(needs_legacy_openssl(
+            &package(r#""@rails/webpacker":"^5.4.0""#),
+            "lts"
+        ));
+        assert!(needs_legacy_openssl(
+            &package(r#""webpack":"^4.46.0""#),
+            "20"
+        ));
+        assert!(needs_legacy_openssl(
+            &package(r#""laravel-mix":"^5.0.1""#),
+            "18"
+        ));
+        // Node 16 rejects the flag, and webpack 5 does not need it.
+        assert!(!needs_legacy_openssl(
+            &package(r#""react-scripts":"4.0.3""#),
+            "16"
+        ));
+        assert!(!needs_legacy_openssl(
+            &package(r#""webpack":"^5.90.0""#),
+            "24"
+        ));
+        assert!(!needs_legacy_openssl(
+            &package(r#""react-scripts":"5.0.1""#),
+            "24"
+        ));
+    }
+
+    #[test]
+    fn a_create_react_app_4_build_sets_the_legacy_openssl_provider() {
+        let (_dir, app) = write_app(&[
+            (
+                "package.json",
+                r#"{"scripts":{"build":"react-scripts build"},"dependencies":{"react-scripts":"4.0.3"}}"#,
+            ),
+            ("package-lock.json", "{}"),
+        ]);
+        let plan = plan_for(&app).plan;
+        assert_eq!(
+            plan.step("build").unwrap().variables["NODE_OPTIONS"],
+            "--openssl-legacy-provider"
+        );
+    }
 
     #[test]
     fn detects_npm_and_plans_install_and_build() {
