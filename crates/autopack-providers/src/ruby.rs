@@ -266,12 +266,38 @@ impl RubyProvider {
 /// Where Rails keeps SQLite databases and Active Storage's local files.
 const RAILS_STORAGE: &str = "/app/storage";
 
+/// Remove YAML comments without truncating a quoted path containing '#'.
+fn yaml_without_comment(line: &str) -> &str {
+    let mut quote = None;
+    let mut escaped = false;
+    let mut previous = ' ';
+    for (index, ch) in line.char_indices() {
+        if escaped {
+            escaped = false;
+            previous = ch;
+            continue;
+        }
+        if quote == Some('"') && ch == '\\' {
+            escaped = true;
+        } else if quote == Some(ch) {
+            quote = None;
+        } else if quote.is_none() && matches!(ch, '\'' | '"') {
+            quote = Some(ch);
+        } else if quote.is_none() && ch == '#' && previous.is_whitespace() {
+            return line[..index].trim_end();
+        }
+        previous = ch;
+    }
+    line.trim_end()
+}
+
 /// Resolve static roots of Disk services without evaluating repository ERB.
 fn disk_storage_roots(storage: &str) -> Vec<Option<String>> {
     let mut services = Vec::<Vec<&str>>::new();
     for line in storage
         .lines()
-        .filter(|line| !line.trim_start().starts_with('#'))
+        .map(yaml_without_comment)
+        .filter(|line| !line.trim().is_empty())
     {
         if !line.starts_with([' ', '\t']) && line.trim_end().ends_with(':') {
             services.push(Vec::new());
@@ -291,7 +317,12 @@ fn disk_storage_roots(storage: &str) -> Vec<Option<String>> {
                 return None;
             }
             let path = if let Some(arguments) = root.strip_prefix("<%= Rails.root.join(") {
-                let arguments = arguments.split(')').next()?;
+                // Match the whole expression, never just its first call.
+                let arguments = arguments
+                    .strip_suffix("%>")?
+                    .trim_end()
+                    .strip_suffix(')')?
+                    .trim();
                 let mut parts = Vec::new();
                 for part in arguments.split(',') {
                     let part = part.trim();
@@ -299,13 +330,20 @@ fn disk_storage_roots(storage: &str) -> Vec<Option<String>> {
                     if !matches!(quote, '\'' | '"') || !part.ends_with(quote) {
                         return None;
                     }
-                    parts.push(part.trim_matches(quote));
+                    let part = part.strip_prefix(quote)?.strip_suffix(quote)?;
+                    if part.contains(quote) || part.contains('\\') {
+                        return None;
+                    }
+                    parts.push(part);
                 }
                 format!("{APP_DIR}/{}", parts.join("/"))
             } else if root.contains("<%") || root.contains("#{") || root.contains("${") {
                 return None;
             } else {
                 let root = root.trim_matches(['\'', '"']);
+                if root.is_empty() || root.contains('\\') || matches!(root, "null" | "~") {
+                    return None;
+                }
                 if root.starts_with('/') {
                     root.to_string()
                 } else {
@@ -562,6 +600,19 @@ fn start_command(app: &App, is_rails: bool) -> Result<Option<String>> {
 mod tests {
     use super::PLATFORM_LOCK;
     use crate::test_support::{plan_for, write_app};
+
+    #[test]
+    fn disk_roots_ignore_yaml_comments_and_refuse_chained_expressions() {
+        let storage = "local:\n  service: Disk # comment\n  root: /data/uploads # uploads\nquoted:\n  service: Disk\n  root: '/data/hash # literal' # comment\nchained:\n  service: Disk\n  root: <%= Rails.root.join(\"storage\").parent.join(\"uploads\") %>\n";
+        assert_eq!(
+            super::disk_storage_roots(storage),
+            [
+                Some("/data/uploads".into()),
+                Some("/data/hash # literal".into()),
+                None
+            ]
+        );
+    }
 
     #[test]
     fn disk_uploads_follow_custom_roots_and_flag_dynamic_roots() {
