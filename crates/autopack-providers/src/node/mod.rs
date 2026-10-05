@@ -317,10 +317,12 @@ PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD), either unset it or drop the dependency.' >&2;
         });
         let caches: Vec<_> = next_directories
             .into_iter()
-            .enumerate()
-            .map(|(index, directory)| {
+            .map(|directory| {
+                let package_scope = directory.bytes().fold(scope, |hash, byte| {
+                    (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+                });
                 ctx.locked_cache(
-                    format!("next-cache-{scope:016x}-{index}"),
+                    format!("next-cache-{package_scope:016x}"),
                     format!("{directory}/.next/cache"),
                 )
             })
@@ -882,6 +884,23 @@ mod tests {
         assert_eq!(
             directories,
             ["/app/apps/admin/.next/cache", "/app/apps/web/.next/cache"]
+        );
+        let web_cache = build
+            .caches
+            .iter()
+            .find(|name| analysis.plan.caches[*name].directory == "/app/apps/web/.next/cache")
+            .unwrap();
+        std::fs::create_dir_all(app.path("apps/aaa")).unwrap();
+        std::fs::write(
+            app.path("apps/aaa/package.json"),
+            r#"{"dependencies":{"next":"15"}}"#,
+        )
+        .unwrap();
+        let refreshed = autopack_core::App::new(app.source()).unwrap();
+        let updated = plan_for(&refreshed);
+        assert_eq!(
+            updated.plan.caches[web_cache].directory,
+            "/app/apps/web/.next/cache"
         );
     }
 
