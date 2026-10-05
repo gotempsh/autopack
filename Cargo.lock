@@ -75,7 +75,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "autopack-cli"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "autopack-core",
@@ -90,7 +90,7 @@ dependencies = [
 
 [[package]]
 name = "autopack-core"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "cap-fs-ext",
  "cap-std",
@@ -106,7 +106,7 @@ dependencies = [
 
 [[package]]
 name = "autopack-dockerfile"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "autopack-core",
  "autopack-providers",
@@ -115,7 +115,7 @@ dependencies = [
 
 [[package]]
 name = "autopack-providers"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "autopack-core",
  "indexmap",
