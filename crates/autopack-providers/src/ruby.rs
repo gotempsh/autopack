@@ -141,12 +141,14 @@ impl Provider for RubyProvider {
                     None => {}
                 }
             }
-            if ctx
-                .app
-                .read_file_opt("config/storage.yml")?
-                .is_some_and(|storage| storage.contains("service: Disk"))
-            {
-                ctx.require_persistent_path(RAILS_STORAGE, "Rails Active Storage can keep local uploads here; retain this directory across redeploys when using the local Disk service.", &[]);
+            if let Some(storage) = ctx.app.read_file_opt("config/storage.yml")? {
+                for path in disk_storage_roots(&storage) {
+                    if let Some(path) = path {
+                        ctx.require_persistent_path(path, "Rails Active Storage Disk uploads need this directory retained across redeploys.", &[]);
+                    } else {
+                        ctx.add_note("Rails Active Storage Disk uses a dynamic or missing root; configure persistent storage for its resolved upload directory before deploying.");
+                    }
+                }
             }
             let declares_release = autopack_core::Procfile::load(ctx.app)?
                 .is_some_and(|procfile| procfile.release().is_some());
@@ -263,6 +265,57 @@ impl RubyProvider {
 
 /// Where Rails keeps SQLite databases and Active Storage's local files.
 const RAILS_STORAGE: &str = "/app/storage";
+
+/// Resolve static roots of Disk services without evaluating repository ERB.
+fn disk_storage_roots(storage: &str) -> Vec<Option<String>> {
+    let mut services = Vec::<Vec<&str>>::new();
+    for line in storage
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+    {
+        if !line.starts_with([' ', '\t']) && line.trim_end().ends_with(':') {
+            services.push(Vec::new());
+        } else if let Some(service) = services.last_mut() {
+            service.push(line.trim());
+        }
+    }
+    services
+        .into_iter()
+        .filter(|service| service.contains(&"service: Disk"))
+        .map(|service| {
+            let root = service
+                .iter()
+                .find_map(|line| line.strip_prefix("root:"))
+                .map(str::trim)?;
+            if root.contains("#{") || root.contains("${") {
+                return None;
+            }
+            let path = if let Some(arguments) = root.strip_prefix("<%= Rails.root.join(") {
+                let arguments = arguments.split(')').next()?;
+                let mut parts = Vec::new();
+                for part in arguments.split(',') {
+                    let part = part.trim();
+                    let quote = part.chars().next()?;
+                    if !matches!(quote, '\'' | '"') || !part.ends_with(quote) {
+                        return None;
+                    }
+                    parts.push(part.trim_matches(quote));
+                }
+                format!("{APP_DIR}/{}", parts.join("/"))
+            } else if root.contains("<%") || root.contains("#{") || root.contains("${") {
+                return None;
+            } else {
+                let root = root.trim_matches(['\'', '"']);
+                if root.starts_with('/') {
+                    root.to_string()
+                } else {
+                    format!("{APP_DIR}/{root}")
+                }
+            };
+            Some(path)
+        })
+        .collect()
+}
 
 /// How `config/database.yml` sets up a SQLite production database.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -509,6 +562,19 @@ fn start_command(app: &App, is_rails: bool) -> Result<Option<String>> {
 mod tests {
     use super::PLATFORM_LOCK;
     use crate::test_support::{plan_for, write_app};
+
+    #[test]
+    fn disk_uploads_follow_custom_roots_and_flag_dynamic_roots() {
+        let storage = "local:\n  service: Disk\n  root: <%= Rails.root.join(\"uploads\", \"media\") %>\nexternal:\n  service: Disk\n  root: /data/uploads\ndynamic:\n  service: Disk\n  root: <%= ENV.fetch(\"UPLOADS\") %>\ncloud:\n  service: S3\n";
+        assert_eq!(
+            super::disk_storage_roots(storage),
+            [
+                Some("/app/uploads/media".into()),
+                Some("/data/uploads".into()),
+                None
+            ]
+        );
+    }
 
     #[test]
     fn rails_persistence_follows_all_production_database_directories() {
