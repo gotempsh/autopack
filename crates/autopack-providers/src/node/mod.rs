@@ -168,7 +168,7 @@ impl Provider for NodeProvider {
         }
 
         self.plan_install(ctx, &package, manager, &browsers)?;
-        self.plan_build(ctx, &package, manager, &browsers)?;
+        self.plan_build(ctx, &package, manager, framework, &browsers)?;
 
         let static_site = static_site(ctx, &package, framework);
         // Deferred until the deploy path is known: a static site serves with
@@ -281,13 +281,56 @@ PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD), either unset it or drop the dependency.' >&2;
         ctx: &mut BuildContext<'_>,
         package: &PackageJson,
         manager: PackageManager,
+        framework: Framework,
         browsers: &BrowserTooling,
     ) -> Result<()> {
         let build_script = package
             .script("build")
             .map(|_| manager.run_command("build"));
 
+        // Cache each Next package at its own build directory, including root
+        // scripts that delegate to workspace apps. Scope locks to the source
+        // checkout so unrelated applications never serialize on one mount.
+        let mut next_directories = Vec::new();
+        if build_script.is_some() {
+            if framework == Framework::Next {
+                next_directories.push(APP_DIR.to_string());
+            }
+            for manifest in ctx.app.find_files("**/package.json")? {
+                if manifest == "package.json" {
+                    continue;
+                }
+                let child: PackageJson = match ctx.app.read_json(&manifest) {
+                    Ok(package) => package,
+                    Err(_) => continue,
+                };
+                if child.has_dependency("next") {
+                    let directory = manifest.trim_end_matches("/package.json");
+                    next_directories.push(format!("{APP_DIR}/{directory}"));
+                }
+            }
+        }
+        let identity = ctx.app.source().to_string_lossy();
+        // Stable FNV-1a digest: cache names contain no host path or shell input.
+        let scope = identity.bytes().fold(0xcbf29ce484222325u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+        });
+        let caches: Vec<_> = next_directories
+            .into_iter()
+            .map(|directory| {
+                let package_scope = directory.bytes().fold(scope, |hash, byte| {
+                    (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+                });
+                ctx.locked_cache(
+                    format!("next-cache-{package_scope:016x}"),
+                    format!("{directory}/.next/cache"),
+                )
+            })
+            .collect();
         let step = ctx.step(steps::BUILD);
+        for cache in caches {
+            step.add_cache(cache);
+        }
         step.inputs = vec![Layer::step(steps::INSTALL), Layer::local()];
         // `pnpm run` may re-invoke install for a deps check; same no-TTY rule.
         if manager == PackageManager::Pnpm {
@@ -776,6 +819,99 @@ mod tests {
             Some("next start")
         );
         assert_eq!(analysis.plan.deploy.variables["NODE_ENV"], "production");
+    }
+
+    #[test]
+    fn next_build_reuses_a_locked_next_cache() {
+        let (_dir, app) = write_app(&[(
+            "package.json",
+            r#"{"dependencies":{"next":"15"},"scripts":{"build":"next build","start":"next start"}}"#,
+        )]);
+        let analysis = plan_for(&app);
+
+        let build = analysis.plan.step("build").unwrap();
+        assert!(
+            build
+                .caches
+                .iter()
+                .any(|name| name.starts_with("next-cache-")),
+            "build step caches: {:?}",
+            build.caches
+        );
+        let cache = &analysis.plan.caches[&build.caches[0]];
+        assert_eq!(cache.directory, format!("{APP_DIR}/.next/cache"));
+        assert_eq!(cache.cache_type, autopack_core::plan::CacheType::Locked);
+    }
+
+    #[test]
+    fn next_caches_are_stable_and_isolated_between_checkouts() {
+        let manifest = r#"{"dependencies":{"next":"15"},"scripts":{"build":"next build","start":"next start"}}"#;
+        let (_first, app) = write_app(&[("package.json", manifest)]);
+        let (_second, other) = write_app(&[("package.json", manifest)]);
+        let names =
+            |app: &autopack_core::App| plan_for(app).plan.step("build").unwrap().caches.clone();
+        assert_eq!(names(&app), names(&app));
+        assert_ne!(names(&app), names(&other));
+    }
+
+    #[test]
+    fn delegated_workspace_build_caches_each_next_package() {
+        let (_dir, app) = write_app(&[
+            (
+                "package.json",
+                r#"{"workspaces":["apps/*"],"scripts":{"build":"cd apps/web && npm run build","start":"cd apps/web && npm start"}}"#,
+            ),
+            (
+                "apps/web/package.json",
+                r#"{"dependencies":{"next":"15"},"scripts":{"build":"next build"}}"#,
+            ),
+            (
+                "apps/admin/package.json",
+                r#"{"dependencies":{"next":"15"}}"#,
+            ),
+            (
+                "apps/other/package.json",
+                r#"{"dependencies":{"vite":"5"}}"#,
+            ),
+        ]);
+        let analysis = plan_for(&app);
+        let build = analysis.plan.step("build").unwrap();
+        let directories: Vec<_> = build
+            .caches
+            .iter()
+            .map(|name| analysis.plan.caches[name].directory.as_str())
+            .collect();
+        assert_eq!(
+            directories,
+            ["/app/apps/admin/.next/cache", "/app/apps/web/.next/cache"]
+        );
+        let web_cache = build
+            .caches
+            .iter()
+            .find(|name| analysis.plan.caches[*name].directory == "/app/apps/web/.next/cache")
+            .unwrap();
+        std::fs::create_dir_all(app.path("apps/aaa")).unwrap();
+        std::fs::write(
+            app.path("apps/aaa/package.json"),
+            r#"{"dependencies":{"next":"15"}}"#,
+        )
+        .unwrap();
+        let refreshed = autopack_core::App::new(app.source()).unwrap();
+        let updated = plan_for(&refreshed);
+        assert_eq!(
+            updated.plan.caches[web_cache].directory,
+            "/app/apps/web/.next/cache"
+        );
+    }
+
+    #[test]
+    fn non_next_builds_get_no_next_cache() {
+        let (_dir, app) = write_app(&[(
+            "package.json",
+            r#"{"dependencies":{"vite":"5"},"scripts":{"build":"vite build"}}"#,
+        )]);
+        let analysis = plan_for(&app);
+        assert!(!analysis.plan.caches.contains_key("next-cache"));
     }
 
     #[test]
