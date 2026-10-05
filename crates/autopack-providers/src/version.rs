@@ -61,6 +61,8 @@ fn leading_number(part: &str) -> Option<u64> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Op {
     Eq,
+    NotMinor,
+    NotMajor,
     Gt,
     Ge,
     Lt,
@@ -89,6 +91,8 @@ impl Bound {
         let candidate = (major, minor, u64::MAX);
         let low = self.version.key(0);
         match self.op {
+            Op::NotMinor => major != self.version.major || minor != self.version.minor,
+            Op::NotMajor => major != self.version.major,
             Op::Eq => {
                 self.version.patch.is_none()
                     && self.version.major == major
@@ -164,7 +168,9 @@ impl Requirement {
                     }
                     None => Op::Minor,
                 };
-                let op = if op == Op::Eq && wildcard {
+                let op = if op == Op::NotMinor && !rest.contains('.') {
+                    Op::NotMajor
+                } else if op == Op::Eq && wildcard {
                     Op::Minor
                 } else {
                     op
@@ -254,12 +260,8 @@ fn split_bounds(alternative: &str) -> Vec<String> {
 }
 
 fn split_operator(token: &str) -> (Option<Op>, &str) {
-    // Excluding a single version never changes which minor is newest, so
-    // `!= 3.1.2` is treated as "anything".
-    if token.starts_with("!=") {
-        return (Some(Op::Ge), "0");
-    }
     for (prefix, op) in [
+        ("!=", Op::NotMinor),
         ("~>", Op::Pessimistic),
         (">=", Op::Ge),
         ("<=", Op::Le),
@@ -280,6 +282,17 @@ fn split_operator(token: &str) -> (Option<Op>, &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn composer_excluded_minor_and_major_are_not_selected() {
+        assert_eq!(
+            Requirement::parse("^8.2 !=8.4.*")
+                .unwrap()
+                .newest(&["8.2", "8.3", "8.4"]),
+            Some("8.3")
+        );
+        assert!(!Requirement::parse(">=7 !=8.*").unwrap().admits("8.4"));
+    }
 
     const MINORS: &[&str] = &["3.0", "3.1", "3.2", "3.3", "3.4", "4.0"];
 

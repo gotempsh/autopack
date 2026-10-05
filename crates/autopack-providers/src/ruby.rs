@@ -117,12 +117,27 @@ impl Provider for RubyProvider {
                          a database server (link Postgres and add the pg gem).",
                         &[],
                     ),
-                    Some(ProductionSqlite::File) => ctx.require_persistent_path(
-                        RAILS_STORAGE,
-                        "The production database is a SQLite file inside the container; \
-                         without persistent storage its data is lost on every redeploy.",
-                        &["DATABASE_URL"],
-                    ),
+                    Some(ProductionSqlite::File(files)) => {
+                        for file in files {
+                            if file.contains("<%") || file.contains("${") {
+                                ctx.add_note("Rails production SQLite uses a dynamic database path; configure persistent storage for its resolved directory before deploying.");
+                                continue;
+                            }
+                            let file = file.trim_matches(['\'', '"']);
+                            let file = if file.starts_with('/') {
+                                file.to_string()
+                            } else {
+                                format!("{APP_DIR}/{file}")
+                            };
+                            if let Some(directory) = std::path::Path::new(&file).parent() {
+                                ctx.require_persistent_path(
+                                    directory.to_string_lossy(),
+                                    "The production SQLite database and its journals need persistent storage; without it data is lost on redeploy.",
+                                    &[],
+                                );
+                            }
+                        }
+                    }
                     None => {}
                 }
             }
@@ -243,10 +258,10 @@ impl RubyProvider {
 const RAILS_STORAGE: &str = "/app/storage";
 
 /// How `config/database.yml` sets up a SQLite production database.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ProductionSqlite {
     /// SQLite, with a database file.
-    File,
+    File(Vec<String>),
     /// SQLite with no file at all: the Rails 8.1 template comments the
     /// production paths out for the operator to choose.
     NoFile,
@@ -302,7 +317,12 @@ fn production_sqlite(database_yml: &str) -> Option<ProductionSqlite> {
     Some(if value("database:").is_empty() {
         ProductionSqlite::NoFile
     } else {
-        ProductionSqlite::File
+        ProductionSqlite::File(
+            value("database:")
+                .iter()
+                .map(|path| path.split(" #").next().unwrap().trim().to_string())
+                .collect(),
+        )
     })
 }
 
@@ -463,19 +483,7 @@ fn start_command(app: &App, is_rails: bool) -> Result<Option<String>> {
 
     if is_rails {
         let server = "bundle exec rails server -b 0.0.0.0 -p ${PORT:-3000}";
-        if !app.has_file("config/database.yml") {
-            return Ok(Some(server.to_string()));
-        }
-        // What Rails' own generated Dockerfile entrypoint does: create the
-        // database if it does not exist and run pending migrations. A new
-        // app's production database is SQLite inside the container, which
-        // only exists once this has run. A failure is reported but does not
-        // stop the server, so the app's own error page explains it.
-        return Ok(Some(format!(
-            "if [ -z \"${{AUTOPACK_NO_MIGRATE:-}}\" ]; then \
-               {RAILS_DB_PREPARE} || echo 'autopack: rails db:prepare failed; set AUTOPACK_NO_MIGRATE=1 to skip it' >&2; \
-             fi; exec {server}"
-        )));
+        return Ok(Some(format!("exec {server}")));
     }
 
     if app.has_file("config.ru") {
@@ -494,6 +502,24 @@ fn start_command(app: &App, is_rails: bool) -> Result<Option<String>> {
 mod tests {
     use super::PLATFORM_LOCK;
     use crate::test_support::{plan_for, write_app};
+
+    #[test]
+    fn rails_persistence_follows_all_production_database_directories() {
+        let (_dir, app) = write_app(&[
+            ("Gemfile", "gem 'rails'"),
+            ("config/database.yml", "production:\n  primary:\n    adapter: sqlite3\n    database: db/production.sqlite3\n  cache:\n    adapter: sqlite3\n    database: data/cache.sqlite3\n"),
+        ]);
+        let plan = plan_for(&app).plan;
+        let paths: Vec<_> = plan
+            .deploy
+            .persistent_paths
+            .iter()
+            .map(|p| p.path.as_str())
+            .collect();
+        assert_eq!(paths, ["/app/db", "/app/data"]);
+        assert!(!plan.deploy.start_command.unwrap().contains("db:prepare"));
+        assert!(plan.deploy.tasks["release"].contains("db:prepare"));
+    }
 
     #[test]
     fn rails_assets_get_node_and_the_apps_javascript_dependencies() {
@@ -590,7 +616,12 @@ mod tests {
 
         let rails_80 = "default: &default\n  adapter: sqlite3\n\nproduction:\n  \
             primary:\n    <<: *default\n    database: storage/production.sqlite3\n";
-        assert_eq!(production_sqlite(rails_80), Some(ProductionSqlite::File));
+        assert_eq!(
+            production_sqlite(rails_80),
+            Some(ProductionSqlite::File(vec![
+                "storage/production.sqlite3".into()
+            ]))
+        );
 
         let postgres = "default: &default\n  adapter: sqlite3\n\nproduction:\n  \
             <<: *default\n  adapter: postgresql\n  database: app\n";
@@ -619,7 +650,7 @@ mod tests {
         let deploy = plan_for(&app).plan.deploy;
         assert_eq!(deploy.persistent_paths.len(), 1);
         assert_eq!(deploy.persistent_paths[0].path, "/app/storage");
-        assert_eq!(deploy.persistent_paths[0].unless_set, vec!["DATABASE_URL"]);
+        assert!(deploy.persistent_paths[0].unless_set.is_empty());
     }
 
     #[test]
@@ -862,8 +893,7 @@ mod tests {
         assert_eq!(deploy.variables["RAILS_SERVE_STATIC_FILES"], "1");
         assert_eq!(deploy.tasks["release"], "bundle exec rails db:prepare");
         let start = deploy.start_command.as_deref().unwrap();
-        assert!(start.contains("bundle exec rails db:prepare ||"), "{start}");
-        assert!(start.contains("AUTOPACK_NO_MIGRATE"), "{start}");
+        assert!(!start.contains("db:prepare"), "{start}");
     }
 
     #[test]

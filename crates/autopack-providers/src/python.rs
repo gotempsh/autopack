@@ -229,15 +229,13 @@ impl Provider for PythonProvider {
                               without persistent storage its data is lost on every \
                               redeploy. Use a database server instead by configuring \
                               DATABASES in settings.";
-                ctx.require_persistent_path(
-                    database.path,
-                    reason,
-                    if database.reads_database_url {
-                        &["DATABASE_URL"]
-                    } else {
-                        &[]
-                    },
-                );
+                if let Some(path) = database.path {
+                    // DATABASE_URL can itself name another SQLite file. Do not
+                    // suppress persistence based on an unrelated variable.
+                    ctx.require_persistent_path(path, reason, &[]);
+                } else {
+                    ctx.add_note("Django configures SQLite with a dynamic database path; configure persistent storage for its resolved directory before deploying.");
+                }
             }
         }
         let build = ctx.step(steps::BUILD);
@@ -453,40 +451,95 @@ fn django_wsgi_module(app: &App) -> Result<Option<String>> {
         .map(|path| path.trim_end_matches(".py").replace('/', ".")))
 }
 
-/// A SQLite database Django settings configure.
+/// A SQLite database Django settings configure. None means its path needs
+/// runtime evaluation; report that instead of claiming a guessed mount.
 struct DjangoSqlite {
-    /// The database file, as the runtime image sees it.
-    path: String,
-    /// Whether the settings let `DATABASE_URL` replace it (dj-database-url,
-    /// django-environ).
-    reads_database_url: bool,
+    path: Option<String>,
 }
 
-/// The SQLite database the Django settings use, if any.
-///
-/// Settings are Python, so this is a reading of their text: a SQLite engine
-/// anywhere in the settings modules, the conventional `db.sqlite3` file name,
-/// and whether `DATABASE_URL` is consulted at all.
+/// Inspect only DATABASES assignments, not unrelated settings or comments.
 fn django_sqlite_database(app: &App) -> Result<Option<DjangoSqlite>> {
     let mut settings = String::new();
     for pattern in ["*/settings.py", "*/settings/*.py"] {
         for file in app.find_files(pattern)? {
-            settings.push_str(&app.read_file(&file)?);
-            settings.push('\n');
+            for line in app.read_file(&file)?.lines() {
+                if !line.trim_start().starts_with('#') {
+                    settings.push_str(line);
+                    settings.push('\n');
+                }
+            }
         }
     }
-    if !settings.contains("django.db.backends.sqlite3") {
+    let Some(start) = settings.find("DATABASES") else {
+        return Ok(None);
+    };
+    let settings = &settings[start..];
+    let Some(open) = settings.find('{') else {
+        return Ok(None);
+    };
+    let mut depth = 0;
+    let mut end = settings.len();
+    for (index, ch) in settings.char_indices().skip_while(|(i, _)| *i < open) {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = index + 1;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let database = &settings[open..end];
+    if !database.contains("django.db.backends.sqlite3") && !database.contains("sqlite:///") {
         return Ok(None);
     }
-    let path = if settings.contains("db.sqlite3") {
-        format!("{APP_DIR}/db.sqlite3")
+    let expression = ["'NAME'", "\"NAME\""].iter().find_map(|key| {
+        database
+            .split_once(key)
+            .and_then(|(_, tail)| tail.split_once(':').map(|(_, value)| value.trim()))
+    });
+    let path = if let Some(expression) = expression {
+        let expression = if expression.starts_with("os.path.join(BASE_DIR,") {
+            expression.split(')').next().unwrap()
+        } else {
+            expression.split([',', '}']).next().unwrap()
+        };
+        let mut literals = Vec::new();
+        let mut chars = expression.chars();
+        while let Some(ch) = chars.next() {
+            if ch == '\'' || ch == '"' {
+                let value: String = chars.by_ref().take_while(|c| *c != ch).collect();
+                literals.push(value);
+            }
+        }
+        if expression.starts_with("BASE_DIR /") || expression.starts_with("os.path.join(BASE_DIR,")
+        {
+            (!literals.is_empty()).then(|| format!("{APP_DIR}/{}", literals.join("/")))
+        } else if expression.starts_with(['\'', '"']) {
+            literals.first().map(|path| {
+                if path.starts_with('/') {
+                    path.clone()
+                } else {
+                    format!("{APP_DIR}/{path}")
+                }
+            })
+        } else {
+            None
+        }
     } else {
-        APP_DIR.to_string()
+        database.split_once("sqlite:///").map(|(_, value)| {
+            let path = value.split(['\'', '"']).next().unwrap();
+            if path.starts_with('/') {
+                path.to_string()
+            } else {
+                format!("{APP_DIR}/{path}")
+            }
+        })
     };
-    Ok(Some(DjangoSqlite {
-        path,
-        reads_database_url: settings.contains("DATABASE_URL"),
-    }))
+    Ok(Some(DjangoSqlite { path }))
 }
 
 /// Raw text of every dependency declaration, for substring checks.
@@ -540,6 +593,17 @@ fn python_version(app: &App, pyproject: &str) -> Result<(String, String)> {
 mod tests {
     use super::*;
     use crate::test_support::{plan_for, write_app};
+
+    #[test]
+    fn django_sqlite_preserves_nested_paths_and_ignores_unrelated_urls() {
+        let (_dir, app) = write_app(&[
+            ("requirements.txt", "django\ngunicorn"), ("manage.py", ""), ("site/wsgi.py", ""),
+            ("site/settings.py", "# DATABASE_URL is not used here\nOTHER = 'DATABASE_URL'\nDATABASES = {'default': {'ENGINE': 'django.db.backends.sqlite3', 'NAME': BASE_DIR / 'data' / 'db.sqlite3'}}"),
+        ]);
+        let plan = plan_for(&app).plan;
+        assert_eq!(plan.deploy.persistent_paths[0].path, "/app/data/db.sqlite3");
+        assert!(plan.deploy.persistent_paths[0].unless_set.is_empty());
+    }
 
     #[test]
     fn pip_projects_install_from_requirements() {
@@ -777,7 +841,7 @@ mod tests {
             ),
         ]);
         let deploy = plan_for(&app).plan.deploy;
-        assert_eq!(deploy.persistent_paths[0].unless_set, vec!["DATABASE_URL"]);
+        assert!(deploy.persistent_paths[0].unless_set.is_empty());
     }
 
     #[test]

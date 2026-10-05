@@ -259,8 +259,20 @@ impl Provider for PhpProvider {
                 );
                 ctx.require_generated_variable("APP_URL", GeneratedValue::PublicUrl);
                 if laravel_defaults_to_sqlite(ctx.app)? {
+                    let database = ctx.env.get("DB_DATABASE").unwrap_or(LARAVEL_SQLITE);
+                    let database = if database.starts_with('/') {
+                        database.to_string()
+                    } else {
+                        format!("{APP_DIR}/{database}")
+                    };
+                    let directory = std::path::Path::new(&database)
+                        .parent()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned();
+                    ctx.add_note("SQLite persistence follows DB_DATABASE supplied during analysis. If it changes at runtime, update the storage mount to that database directory.");
                     ctx.require_persistent_path(
-                        LARAVEL_SQLITE,
+                        directory,
                         "Laravel's default database is a SQLite file inside the \
                          container; it is created at start so the app boots, but \
                          without persistent storage its data (users, sessions, jobs) is \
@@ -272,7 +284,7 @@ impl Provider for PhpProvider {
                 let declares_release = autopack_core::Procfile::load(ctx.app)?
                     .is_some_and(|procfile| procfile.release().is_some());
                 if !declares_release {
-                    ctx.add_task("release", LARAVEL_MIGRATE);
+                    ctx.add_task("release", laravel_release_command());
                 }
             }
             Some("symfony") => {
@@ -486,24 +498,19 @@ fn laravel_defaults_to_sqlite(app: &App) -> Result<bool> {
 /// Runs pending migrations without prompting.
 const LARAVEL_MIGRATE: &str = "php artisan migrate --force";
 
-/// Start a Laravel app: prepare its database, then serve.
-///
-/// A fresh Laravel app defaults to SQLite at `database/database.sqlite`, a
-/// file `composer create-project` creates and git ignores, so it never
-/// reaches the image; without it the first request that touches the session
-/// table is a 500. When no other database is configured the file is created,
-/// and pending migrations run either way, as Laravel's own deploy tooling
-/// does. A failure is reported but does not stop the server.
-fn laravel_start_command() -> String {
+/// Create a missing SQLite file before the one-off migration task. Database
+/// migrations must fail the deployment, never race on every server restart.
+fn laravel_release_command() -> String {
     format!(
-        "if [ -z \"${{AUTOPACK_NO_MIGRATE:-}}\" ]; then \
-           if [ \"${{DB_CONNECTION:-sqlite}}\" = sqlite ] && [ -z \"${{DB_URL:-}}\" ]; then \
-             db=\"${{DB_DATABASE:-/app/database/database.sqlite}}\"; \
-             mkdir -p \"$(dirname \"$db\")\" && touch \"$db\"; \
-           fi; \
-           {LARAVEL_MIGRATE} || echo 'autopack: php artisan migrate failed; set AUTOPACK_NO_MIGRATE=1 to skip it' >&2; \
-         fi; exec frankenphp run --config {CADDYFILE_PATH}"
+        "if [ \"${{DB_CONNECTION:-sqlite}}\" = sqlite ] && [ -z \"${{DB_URL:-}}\" ]; then \
+           db=\"${{DB_DATABASE:-/app/database/database.sqlite}}\"; \
+           if [ \"$db\" != ':memory:' ]; then mkdir -p \"$(dirname \"$db\")\" && touch \"$db\" || exit 1; fi; \
+         fi; {LARAVEL_MIGRATE}"
     )
+}
+
+fn laravel_start_command() -> String {
+    format!("exec frankenphp run --config {CADDYFILE_PATH}")
 }
 
 /// The PHP version to build with, and why.
@@ -708,6 +715,62 @@ mod tests {
     use autopack_core::plan::GeneratedValue;
 
     #[test]
+    fn laravel_release_creates_sqlite_before_migrating_and_propagates_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("data/custom.sqlite");
+        let stub = directory.path().join("php");
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\ntest -f \"$DB_DATABASE\" || exit 99\nexit 7\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(super::laravel_release_command())
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    directory.path().display(),
+                    std::env::var("PATH").unwrap()
+                ),
+            )
+            .env("DB_CONNECTION", "sqlite")
+            .env("DB_URL", "")
+            .env("DB_DATABASE", &database)
+            .status()
+            .unwrap();
+        assert!(database.is_file());
+        assert_eq!(status.code(), Some(7));
+        assert!(!super::laravel_start_command().contains("migrate"));
+    }
+
+    #[test]
+    fn laravel_persistence_uses_the_effective_database_directory() {
+        let (_dir, app) = write_app(&[
+            (
+                "composer.json",
+                r#"{"require":{"laravel/framework":"^11.0"}}"#,
+            ),
+            ("artisan", ""),
+            ("public/index.php", "<?php"),
+            (
+                "config/database.php",
+                "<?php return ['default' => env('DB_CONNECTION', 'sqlite')];",
+            ),
+        ]);
+        let analysis =
+            crate::test_support::plan_with_env(&app, &[("DB_DATABASE", "/data/custom.sqlite")])
+                .unwrap();
+        assert_eq!(analysis.plan.deploy.persistent_paths[0].path, "/data");
+    }
+
+    #[test]
     fn laravel_apps_serve_the_public_directory() {
         let (_dir, app) = write_app(&[
             (
@@ -728,8 +791,10 @@ mod tests {
         assert_eq!(analysis.metadata["documentRoot"], "/app/public");
         let start = analysis.plan.deploy.start_command.as_deref().unwrap();
         assert!(start.ends_with("exec frankenphp run --config /app/Caddyfile"));
-        assert!(start.contains("php artisan migrate --force"));
-        assert!(start.contains("AUTOPACK_NO_MIGRATE"));
+        assert!(!start.contains("migrate"));
+        let release = &analysis.plan.deploy.tasks["release"];
+        assert!(release.contains("touch"));
+        assert!(release.contains("php artisan migrate --force"));
     }
 
     #[test]
@@ -776,10 +841,7 @@ mod tests {
         ]);
         let deploy = plan_for(&app).plan.deploy;
         assert_eq!(deploy.persistent_paths.len(), 1);
-        assert_eq!(
-            deploy.persistent_paths[0].path,
-            "/app/database/database.sqlite"
-        );
+        assert_eq!(deploy.persistent_paths[0].path, "/app/database");
         assert_eq!(
             deploy.persistent_paths[0].unless_set,
             vec!["DB_URL", "DB_HOST"]
