@@ -141,6 +141,13 @@ impl Provider for RubyProvider {
                     None => {}
                 }
             }
+            if ctx
+                .app
+                .read_file_opt("config/storage.yml")?
+                .is_some_and(|storage| storage.contains("service: Disk"))
+            {
+                ctx.require_persistent_path(RAILS_STORAGE, "Rails Active Storage can keep local uploads here; retain this directory across redeploys when using the local Disk service.", &[]);
+            }
             let declares_release = autopack_core::Procfile::load(ctx.app)?
                 .is_some_and(|procfile| procfile.release().is_some());
             if ctx.app.has_file("config/database.yml") && !declares_release {
@@ -483,7 +490,7 @@ fn start_command(app: &App, is_rails: bool) -> Result<Option<String>> {
 
     if is_rails {
         let server = "bundle exec rails server -b 0.0.0.0 -p ${PORT:-3000}";
-        return Ok(Some(format!("exec {server}")));
+        return Ok(Some(server.to_string()));
     }
 
     if app.has_file("config.ru") {
@@ -507,6 +514,7 @@ mod tests {
     fn rails_persistence_follows_all_production_database_directories() {
         let (_dir, app) = write_app(&[
             ("Gemfile", "gem 'rails'"),
+            ("config/storage.yml", "local:\n  service: Disk\n  root: <%= Rails.root.join(\"storage\") %>"),
             ("config/database.yml", "production:\n  primary:\n    adapter: sqlite3\n    database: db/production.sqlite3\n  cache:\n    adapter: sqlite3\n    database: data/cache.sqlite3\n"),
         ]);
         let plan = plan_for(&app).plan;
@@ -516,7 +524,7 @@ mod tests {
             .iter()
             .map(|p| p.path.as_str())
             .collect();
-        assert_eq!(paths, ["/app/db", "/app/data"]);
+        assert_eq!(paths, ["/app/db", "/app/data", "/app/storage"]);
         assert!(!plan.deploy.start_command.unwrap().contains("db:prepare"));
         assert!(plan.deploy.tasks["release"].contains("db:prepare"));
     }

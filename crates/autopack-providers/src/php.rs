@@ -258,7 +258,9 @@ impl Provider for PhpProvider {
                     GeneratedValue::PrefixedBase64Secret { bytes: 32 },
                 );
                 ctx.require_generated_variable("APP_URL", GeneratedValue::PublicUrl);
-                if laravel_defaults_to_sqlite(ctx.app)? {
+                if laravel_defaults_to_sqlite(ctx.app)?
+                    && ctx.env.get("DB_DATABASE") != Some(":memory:")
+                {
                     let database = ctx.env.get("DB_DATABASE").unwrap_or(LARAVEL_SQLITE);
                     let database = if database.starts_with('/') {
                         database.to_string()
@@ -281,11 +283,13 @@ impl Provider for PhpProvider {
                         &["DB_URL", "DB_HOST"],
                     );
                 }
-                let declares_release = autopack_core::Procfile::load(ctx.app)?
-                    .is_some_and(|procfile| procfile.release().is_some());
-                if !declares_release {
-                    ctx.add_task("release", laravel_release_command());
-                }
+                let custom_release = autopack_core::Procfile::load(ctx.app)?
+                    .and_then(|procfile| procfile.release().map(str::to_string));
+                let release = custom_release.as_deref().unwrap_or(LARAVEL_MIGRATE);
+                ctx.add_task(
+                    "release",
+                    format!("{}; {release}", laravel_sqlite_initialize()),
+                );
             }
             Some("symfony") => {
                 ctx.require_generated_variable(
@@ -500,17 +504,21 @@ const LARAVEL_MIGRATE: &str = "php artisan migrate --force";
 
 /// Create a missing SQLite file before the one-off migration task. Database
 /// migrations must fail the deployment, never race on every server restart.
-fn laravel_release_command() -> String {
-    format!(
-        "if [ \"${{DB_CONNECTION:-sqlite}}\" = sqlite ] && [ -z \"${{DB_URL:-}}\" ]; then \
-           db=\"${{DB_DATABASE:-/app/database/database.sqlite}}\"; \
+fn laravel_sqlite_initialize() -> String {
+    "if [ \"${DB_CONNECTION:-sqlite}\" = sqlite ] && [ -z \"${DB_URL:-}\" ]; then \
+           db=\"${DB_DATABASE:-/app/database/database.sqlite}\"; \
            if [ \"$db\" != ':memory:' ]; then mkdir -p \"$(dirname \"$db\")\" && touch \"$db\" || exit 1; fi; \
-         fi; {LARAVEL_MIGRATE}"
-    )
+         fi"
+    .to_string()
+}
+
+#[cfg(test)]
+fn laravel_release_command() -> String {
+    format!("{}; {LARAVEL_MIGRATE}", laravel_sqlite_initialize())
 }
 
 fn laravel_start_command() -> String {
-    format!("exec frankenphp run --config {CADDYFILE_PATH}")
+    format!("frankenphp run --config {CADDYFILE_PATH}")
 }
 
 /// The PHP version to build with, and why.
@@ -751,6 +759,30 @@ mod tests {
     }
 
     #[test]
+    fn in_memory_sqlite_needs_no_mount_and_custom_release_keeps_initialization() {
+        let (_dir, app) = write_app(&[
+            (
+                "composer.json",
+                r#"{"require":{"laravel/framework":"^11.0"}}"#,
+            ),
+            ("artisan", ""),
+            ("public/index.php", "<?php"),
+            (
+                "config/database.php",
+                "<?php return ['default' => env('DB_CONNECTION', 'sqlite')];",
+            ),
+            ("Procfile", "release: php artisan custom:prepare\n"),
+        ]);
+        let analysis =
+            crate::test_support::plan_with_env(&app, &[("DB_DATABASE", ":memory:")]).unwrap();
+        assert!(analysis.plan.deploy.persistent_paths.is_empty());
+        let release = &analysis.plan.deploy.tasks["release"];
+        assert!(release.contains("touch"));
+        assert!(release.ends_with("php artisan custom:prepare"));
+        assert!(!release.contains("artisan migrate"));
+    }
+
+    #[test]
     fn laravel_persistence_uses_the_effective_database_directory() {
         let (_dir, app) = write_app(&[
             (
@@ -790,7 +822,7 @@ mod tests {
         assert_eq!(analysis.metadata["image"], "dunglas/frankenphp:1-php8.4");
         assert_eq!(analysis.metadata["documentRoot"], "/app/public");
         let start = analysis.plan.deploy.start_command.as_deref().unwrap();
-        assert!(start.ends_with("exec frankenphp run --config /app/Caddyfile"));
+        assert!(start.ends_with("frankenphp run --config /app/Caddyfile"));
         assert!(!start.contains("migrate"));
         let release = &analysis.plan.deploy.tasks["release"];
         assert!(release.contains("touch"));

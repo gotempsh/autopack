@@ -62,6 +62,7 @@ fn leading_number(part: &str) -> Option<u64> {
 enum Op {
     Eq,
     NotMinor,
+    NotPatch,
     NotMajor,
     Gt,
     Ge,
@@ -91,6 +92,7 @@ impl Bound {
         let candidate = (major, minor, u64::MAX);
         let low = self.version.key(0);
         match self.op {
+            Op::NotPatch => true,
             Op::NotMinor => major != self.version.major || minor != self.version.minor,
             Op::NotMajor => major != self.version.major,
             Op::Eq => {
@@ -168,7 +170,9 @@ impl Requirement {
                     }
                     None => Op::Minor,
                 };
-                let op = if op == Op::NotMinor && !rest.contains('.') {
+                let op = if op == Op::NotMinor && Version::is_full(rest) {
+                    Op::NotPatch
+                } else if op == Op::NotMinor && !rest.contains('.') {
                     Op::NotMajor
                 } else if op == Op::Eq && wildcard {
                     Op::Minor
@@ -282,6 +286,16 @@ fn split_operator(token: &str) -> (Option<Op>, &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn excluding_a_patch_keeps_later_patches_in_the_minor_available() {
+        assert_eq!(
+            Requirement::parse("^8.4 !=8.4.0")
+                .unwrap()
+                .newest(&["8.2", "8.3", "8.4"]),
+            Some("8.4")
+        );
+    }
 
     #[test]
     fn composer_excluded_minor_and_major_are_not_selected() {
