@@ -44,16 +44,17 @@ const MAX_DEPTH: usize = 8;
 /// Upper bound on indexed paths, so a pathological repo cannot stall detection.
 const MAX_ENTRIES: usize = 50_000;
 
-/// Resolve `relative` under `root`, or `None` when it is missing or escapes `root`.
-///
-/// The source tree is untrusted input. Resolving through the filesystem would
-/// otherwise follow a link such as `package.json -> /etc/passwd`, a directory
-/// link such as `config -> /`, or a `..` path, and read the build host's files
-/// during detection. Links that stay inside the tree still resolve, matching
-/// what the build context will contain. `root` must already be canonical.
-pub(crate) fn resolve_within(root: &Path, relative: &Path) -> Option<PathBuf> {
-    let resolved = root.join(relative).canonicalize().ok()?;
-    resolved.starts_with(root).then_some(resolved)
+/// Acquire the source entry without following a replacement symlink. Its
+/// parent is platform-owned, outside the untrusted repository. Once opened,
+/// all source operations use this directory capability, not its old pathname.
+fn open_source_directory(source: &Path) -> std::io::Result<cap_std::fs::Dir> {
+    use cap_fs_ext::DirExt;
+    if let (Some(parent), Some(name)) = (source.parent(), source.file_name()) {
+        let parent = cap_std::fs::Dir::open_ambient_dir(parent, cap_std::ambient_authority())?;
+        parent.open_dir_nofollow(name)
+    } else {
+        cap_std::fs::Dir::open_ambient_dir(source, cap_std::ambient_authority())
+    }
 }
 
 /// A source directory being analysed.
@@ -85,8 +86,7 @@ impl App {
                 path: source.to_path_buf(),
                 source: source_error,
             })?;
-        let directory = cap_std::fs::Dir::open_ambient_dir(&source, cap_std::ambient_authority())
-            .map_err(|source_error| Error::ReadFile {
+        let directory = open_source_directory(&source).map_err(|source_error| Error::ReadFile {
             path: source.clone(),
             source: source_error,
         })?;
@@ -114,22 +114,18 @@ impl App {
     ///
     /// A symlink or `..` path that leads out of the tree counts as absent.
     pub fn has_file(&self, relative: impl AsRef<Path>) -> bool {
-        resolve_within(&self.source, relative.as_ref()).is_some_and(|path| {
-            self.directory
-                .metadata(path.strip_prefix(&self.source).unwrap())
-                .is_ok_and(|metadata| metadata.is_file())
-        })
+        self.directory
+            .metadata(relative)
+            .is_ok_and(|metadata| metadata.is_file())
     }
 
     /// True when `relative` exists inside the source tree and is a directory.
     ///
     /// A symlink or `..` path that leads out of the tree counts as absent.
     pub fn has_dir(&self, relative: impl AsRef<Path>) -> bool {
-        resolve_within(&self.source, relative.as_ref()).is_some_and(|path| {
-            self.directory
-                .metadata(path.strip_prefix(&self.source).unwrap())
-                .is_ok_and(|metadata| metadata.is_dir())
-        })
+        self.directory
+            .metadata(relative)
+            .is_ok_and(|metadata| metadata.is_dir())
     }
 
     /// True when any of `candidates` exists as a file.
@@ -175,26 +171,17 @@ impl App {
 
     /// Read `relative` as UTF-8.
     ///
-    /// Refuses a symlink or `..` path that leads out of the source tree.
+    /// Refuses absolute paths and symlink targets, or `..` traversal that
+    /// leads out of the retained source directory.
     pub fn read_file(&self, relative: impl AsRef<Path>) -> Result<String> {
         let relative = relative.as_ref();
         let read_error = |source| Error::ReadFile {
             path: relative.to_path_buf(),
             source,
         };
-        let resolved = self.path(relative).canonicalize().map_err(read_error)?;
-        if !resolved.starts_with(&self.source) {
-            return Err(read_error(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "the path leads outside the source directory",
-            )));
-        }
-        // Open beneath the retained directory handle, never through the ambient
-        // resolved path. A concurrent directory/symlink replacement cannot
-        // redirect this open outside the source capability.
-        self.directory
-            .read_to_string(resolved.strip_prefix(&self.source).unwrap())
-            .map_err(read_error)
+        // Resolve and open within the retained directory in one confined
+        // operation, including when the source pathname has been moved.
+        self.directory.read_to_string(relative).map_err(read_error)
     }
 
     /// Read `relative` as UTF-8, or `None` when it does not exist.
@@ -259,38 +246,45 @@ impl App {
     fn index(&self) -> Vec<String> {
         let mut files = Vec::new();
 
-        let walker = walkdir::WalkDir::new(&self.source)
-            .max_depth(MAX_DEPTH)
-            .follow_links(false)
-            .into_iter()
-            .filter_entry(|entry| {
-                if entry.depth() == 0 {
-                    return true;
-                }
-                let name = entry.file_name().to_string_lossy();
-                !(entry.file_type().is_dir() && SKIP_DIRS.contains(&name.as_ref()))
-            });
-
-        for entry in walker.filter_map(std::result::Result::ok) {
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            let Ok(relative) = entry.path().strip_prefix(&self.source) else {
+        let mut pending = vec![(PathBuf::new(), 0)];
+        let mut visited = 0;
+        'walk: while let Some((directory, depth)) = pending.pop() {
+            let path = if directory.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                &directory
+            };
+            let Ok(entries) = self.directory.read_dir(path) else {
                 continue;
             };
-            let relative = relative
-                .components()
-                .map(|c| c.as_os_str().to_string_lossy())
-                .collect::<Vec<_>>()
-                .join("/");
-            files.push(relative);
-
-            if files.len() >= MAX_ENTRIES {
-                tracing::warn!(
-                    limit = MAX_ENTRIES,
-                    "source tree is very large; glob matching only sees the first {MAX_ENTRIES} files"
-                );
-                break;
+            for entry in entries.filter_map(std::result::Result::ok) {
+                visited += 1;
+                if visited > MAX_ENTRIES {
+                    tracing::warn!(
+                        limit = MAX_ENTRIES,
+                        "source indexing reached its entry bound"
+                    );
+                    break 'walk;
+                }
+                let name = entry.file_name();
+                let relative = directory.join(&name);
+                let Ok(kind) = entry.file_type() else {
+                    continue;
+                };
+                if kind.is_file() {
+                    files.push(
+                        relative
+                            .components()
+                            .map(|component| component.as_os_str().to_string_lossy())
+                            .collect::<Vec<_>>()
+                            .join("/"),
+                    );
+                } else if kind.is_dir()
+                    && depth + 1 < MAX_DEPTH
+                    && !SKIP_DIRS.contains(&name.to_string_lossy().as_ref())
+                {
+                    pending.push((relative, depth + 1));
+                }
             }
         }
 
@@ -311,6 +305,19 @@ mod tests {
             fs::write(full, contents).unwrap();
         }
         dir
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_entry_swapped_for_a_symlink_cannot_acquire_a_capability() {
+        let parent = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let root = parent.path().join("source");
+        fs::create_dir(&root).unwrap();
+        let canonical = root.canonicalize().unwrap();
+        fs::rename(&root, parent.path().join("parked")).unwrap();
+        std::os::unix::fs::symlink(external.path(), &root).unwrap();
+        assert!(super::open_source_directory(&canonical).is_err());
     }
 
     #[cfg(unix)]
@@ -359,8 +366,10 @@ mod tests {
         let app = App::new(&root).unwrap();
         fs::rename(&root, parent.path().join("retained")).unwrap();
         fs::create_dir(&root).unwrap();
-        fs::write(root.join("value"), "replacement").unwrap();
+        // The replacement deliberately has no matching file.
         assert_eq!(app.read_file("value").unwrap(), "original");
+        assert!(app.has_file("value"));
+        assert_eq!(app.files(), &["value".to_string()]);
     }
 
     #[test]
