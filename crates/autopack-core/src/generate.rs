@@ -902,6 +902,31 @@ mod tests {
     }
 
     #[test]
+    fn generated_plans_scope_caches_only_when_requested() {
+        let first = app_fixture();
+        let second = app_fixture();
+        let first_app = App::new(first.path()).unwrap();
+        let second_app = App::new(second.path()).unwrap();
+        let config = Config::default();
+        let shared = Environment::new();
+        let scoped = Environment::from_pairs([("AUTOPACK_CACHE_SCOPE", "app")]);
+        let mut shared_ctx = BuildContext::new(&first_app, &shared, &config);
+        shared_ctx.set_start_command("true");
+        assert!(shared_ctx.generate().unwrap().cache_scope.is_none());
+        let mut first_ctx = BuildContext::new(&first_app, &scoped, &config);
+        let mut second_ctx = BuildContext::new(&second_app, &scoped, &config);
+        first_ctx.set_start_command("true");
+        second_ctx.set_start_command("true");
+        let first_scope = first_ctx.generate().unwrap().cache_scope.unwrap();
+        let second_scope = second_ctx.generate().unwrap().cache_scope.unwrap();
+        assert_ne!(first_scope, second_scope);
+        assert_eq!(
+            first_scope,
+            first_ctx.generate().unwrap().cache_scope.unwrap()
+        );
+    }
+
+    #[test]
     fn generates_packages_and_runtime_steps() {
         let dir = app_fixture();
         let app = App::new(dir.path()).unwrap();
