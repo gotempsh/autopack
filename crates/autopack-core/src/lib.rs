@@ -33,6 +33,7 @@
 #![deny(missing_docs)]
 
 pub mod app;
+pub mod apt;
 pub mod compat;
 pub mod config;
 pub mod env;
@@ -85,6 +86,8 @@ pub struct Analysis {
     pub metadata: IndexMap<String, String>,
     /// Runtimes that will be installed, and where each version came from.
     pub packages: Vec<(String, PackageRequest)>,
+    /// Effective mise release used to resolve and install those runtimes.
+    pub mise_version: String,
 }
 
 /// Detect a provider for `app` and generate its build plan.
@@ -139,10 +142,16 @@ pub fn analyze(app: &App, env: &Environment, registry: &ProviderRegistry) -> Res
         .map(|(name, request)| (name.to_string(), request.clone()))
         .collect();
 
+    let mise_version = env
+        .config("MISE_VERSION")
+        .unwrap_or(mise::DEFAULT_MISE_VERSION)
+        .to_string();
+
     Ok(Analysis {
         provider: provider.id().to_string(),
         plan,
         metadata: ctx.metadata.clone(),
         packages,
+        mise_version,
     })
 }

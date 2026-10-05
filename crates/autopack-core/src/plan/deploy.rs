@@ -45,6 +45,86 @@ pub struct Deploy {
     /// replica per restart.
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
     pub tasks: IndexMap<String, String>,
+
+    /// Environment variables the app cannot start without, which the
+    /// platform has to create because no image can carry them: a framework
+    /// secret (`SECRET_KEY_BASE`, `APP_KEY`) must be unique to the app and
+    /// stable across deploys, and a public host is only known to the
+    /// platform.
+    ///
+    /// A platform creates each one that the app's environment does not
+    /// already define, once, and keeps it. Values the user sets always win.
+    #[serde(
+        default,
+        skip_serializing_if = "IndexMap::is_empty",
+        rename = "generatedVariables"
+    )]
+    pub generated_variables: IndexMap<String, GeneratedVariable>,
+
+    /// Places the app keeps data that has to outlive the container — a SQLite
+    /// database, uploaded files — which a container's own filesystem loses on
+    /// every redeploy.
+    ///
+    /// A platform that can mount persistent storage there should; one that
+    /// cannot should tell the user before their data is lost, not after.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        rename = "persistentPaths"
+    )]
+    pub persistent_paths: Vec<PersistentPath>,
+}
+
+/// One entry of [`Deploy::persistent_paths`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistentPath {
+    /// File or directory in the runtime image that holds the data.
+    pub path: String,
+    /// What is kept there and what happens without persistent storage,
+    /// written for the person deploying the app.
+    pub reason: String,
+    /// Variables that move the data elsewhere when the environment sets any
+    /// of them (`DATABASE_URL` pointing at a database server).
+    #[serde(default, skip_serializing_if = "Vec::is_empty", rename = "unlessSet")]
+    pub unless_set: Vec<String>,
+}
+
+/// One entry of [`Deploy::generated_variables`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GeneratedVariable {
+    /// How to produce the value.
+    #[serde(flatten)]
+    pub value: GeneratedValue,
+    /// Variables that make this one unnecessary when the environment sets
+    /// any of them: Rails reads its secret from encrypted credentials when it
+    /// has `RAILS_MASTER_KEY`, and a generated `SECRET_KEY_BASE` would
+    /// silently take precedence over that one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty", rename = "unlessSet")]
+    pub unless_set: Vec<String>,
+}
+
+/// How a platform should produce a [`Deploy::generated_variables`] value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum GeneratedValue {
+    /// `bytes` random bytes, hex-encoded (Rails `SECRET_KEY_BASE`, Symfony
+    /// `APP_SECRET`).
+    HexSecret {
+        /// Random bytes before encoding.
+        bytes: u32,
+    },
+    /// `bytes` random bytes, standard base64 with a `base64:` prefix — the
+    /// format `php artisan key:generate` writes for Laravel's `APP_KEY`.
+    PrefixedBase64Secret {
+        /// Random bytes before encoding.
+        bytes: u32,
+    },
+    /// The host name the app is publicly served on, without a scheme
+    /// (Phoenix `PHX_HOST`).
+    PublicHost,
+    /// The URL the app is publicly served on, with its scheme (Laravel
+    /// `APP_URL`).
+    PublicUrl,
 }
 
 /// An unprivileged user created in the runtime image.
@@ -92,5 +172,33 @@ impl Deploy {
             self.paths.push(path);
         }
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generated_variables_serialise_flat_with_optional_alternatives() {
+        let variable = GeneratedVariable {
+            value: GeneratedValue::HexSecret { bytes: 64 },
+            unless_set: vec!["RAILS_MASTER_KEY".to_string()],
+        };
+        let json = serde_json::to_value(&variable).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"kind": "hexSecret", "bytes": 64, "unlessSet": ["RAILS_MASTER_KEY"]})
+        );
+        assert_eq!(
+            serde_json::from_value::<GeneratedVariable>(json).unwrap(),
+            variable
+        );
+
+        // Without alternatives the field is omitted, and absent reads back empty.
+        let plain = serde_json::json!({"kind": "publicUrl"});
+        let parsed: GeneratedVariable = serde_json::from_value(plain.clone()).unwrap();
+        assert!(parsed.unless_set.is_empty());
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), plain);
     }
 }

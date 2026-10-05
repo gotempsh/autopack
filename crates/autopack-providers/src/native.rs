@@ -29,25 +29,6 @@ pub struct NativeDependency {
     pub runtime: &'static [&'static str],
 }
 
-/// Chromium's shared library closure, needed by headless browsers.
-pub(crate) const CHROMIUM_RUNTIME: &[&str] = &[
-    "libnss3",
-    "libnspr4",
-    "libatk1.0-0",
-    "libatk-bridge2.0-0",
-    "libcups2",
-    "libdrm2",
-    "libxkbcommon0",
-    "libxcomposite1",
-    "libxdamage1",
-    "libxfixes3",
-    "libxrandr2",
-    "libgbm1",
-    "libasound2",
-    "libpango-1.0-0",
-    "libcairo2",
-];
-
 /// Node packages that need system libraries.
 pub const NODE: &[NativeDependency] = &[
     // node-canvas compiles against Cairo and friends; there are no prebuilt
@@ -173,7 +154,9 @@ pub const RUBY: &[NativeDependency] = &[
     NativeDependency {
         package: "ffi",
         build: &["libffi-dev"],
-        runtime: &["libffi8"],
+        // The soname is in the package name and differs by Debian release;
+        // a pinned Ruby patch can land on any of them.
+        runtime: &["libffi8|libffi7|libffi6"],
     },
     // Nokogiri vendors and statically links its own libxml2, so only the
     // source-build path needs headers and the runtime needs nothing.
@@ -190,7 +173,7 @@ pub const RUBY: &[NativeDependency] = &[
     NativeDependency {
         package: "charlock_holmes",
         build: &["libicu-dev"],
-        runtime: &["libicu72"],
+        runtime: &["libicu76|libicu72|libicu67|libicu63"],
     },
     NativeDependency {
         package: "curb",

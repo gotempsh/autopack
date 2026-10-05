@@ -57,16 +57,14 @@ impl Lock {
     }
 
     /// Read the lock from an app directory, if one exists.
+    ///
+    /// A lock that is a symlink leading out of `app_root` counts as absent,
+    /// like every other file read from the source tree.
     pub fn load(app_root: &Path) -> Result<Option<Self>> {
-        let path = app_root.join(LOCK_FILE);
-        if !path.is_file() {
+        let app = crate::App::new(app_root)?;
+        let Some(contents) = app.read_file_opt(LOCK_FILE)? else {
             return Ok(None);
-        }
-
-        let contents = std::fs::read_to_string(&path).map_err(|source| Error::ReadFile {
-            path: LOCK_FILE.into(),
-            source,
-        })?;
+        };
         let lock: Lock = serde_json::from_str(&contents).map_err(|e| Error::ParseFile {
             path: LOCK_FILE.into(),
             message: e.to_string(),
@@ -184,6 +182,22 @@ mod tests {
     #[test]
     fn a_missing_lock_is_not_an_error() {
         let dir = tempfile::tempdir().unwrap();
+        assert_eq!(Lock::load(dir.path()).unwrap(), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_lock_linked_from_outside_the_app_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join(LOCK_FILE);
+        std::fs::write(&target, Lock::new().to_json().unwrap()).unwrap();
+        // Control: the same lock in the app directory is read.
+        std::fs::copy(&target, dir.path().join(LOCK_FILE)).unwrap();
+        assert!(Lock::load(dir.path()).unwrap().is_some());
+
+        std::fs::remove_file(dir.path().join(LOCK_FILE)).unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join(LOCK_FILE)).unwrap();
         assert_eq!(Lock::load(dir.path()).unwrap(), None);
     }
 }

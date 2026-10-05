@@ -67,8 +67,8 @@ SPECS=(
 
 pass=0
 fail=0
-declare -a FAILURES
-declare -a REPORT
+declare -a FAILURES=()
+declare -a REPORT=()
 
 cleanup() { docker rm -f "${CONTAINER}" >/dev/null 2>&1 || true; }
 trap 'cleanup; rm -rf "${WORK}"' EXIT

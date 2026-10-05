@@ -432,7 +432,11 @@ fn one_line(value: &str) -> String {
 
 fn cache_id(name: &str, cache: &Cache, scope: Option<&str>) -> String {
     match scope {
-        Some(scope) => format!("autopack-{scope}-{name}-{}", sanitize(&cache.directory)),
+        Some(scope) => format!(
+            "autopack-{}-{name}-{}",
+            sanitize(scope),
+            sanitize(&cache.directory)
+        ),
         None => format!("autopack-{name}-{}", sanitize(&cache.directory)),
     }
 }
@@ -517,6 +521,13 @@ mod tests {
             cache_id("npm-store", &cache, Some("abc123")),
             cache_id("pnpm-store", &cache, Some("abc123"))
         );
+    }
+
+    #[test]
+    fn cache_scope_cannot_inject_mount_options_or_directives() {
+        let cache = Cache::shared("/cache/npm");
+        let id = cache_id("npm-store", &cache, Some("app,target=/etc\nRUN evil"));
+        assert!(id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
     }
 
     #[test]

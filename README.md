@@ -53,9 +53,9 @@ than tracking `main`, or a build tool starts changing under you between deploys:
 
 ```toml
 [dependencies]
-autopack-core       = { git = "https://github.com/gotempsh/autopack", tag = "v0.1.1" }
-autopack-providers  = { git = "https://github.com/gotempsh/autopack", tag = "v0.1.1" }
-autopack-dockerfile = { git = "https://github.com/gotempsh/autopack", tag = "v0.1.1" }
+autopack-core       = { git = "https://github.com/gotempsh/autopack", tag = "v0.1.3" }
+autopack-providers  = { git = "https://github.com/gotempsh/autopack", tag = "v0.1.3" }
+autopack-dockerfile = { git = "https://github.com/gotempsh/autopack", tag = "v0.1.3" }
 ```
 
 A host that only needs to *consume* plans — store them, diff them, render them —
@@ -162,7 +162,7 @@ Every tagged release publishes a static binary for Linux (x86_64, aarch64) and
 macOS (Intel, Apple silicon), with a `SHA256SUMS` file alongside them:
 
 ```bash
-VERSION=0.1.1
+VERSION=0.1.3
 TARGET=aarch64-apple-darwin   # or x86_64-unknown-linux-musl, aarch64-unknown-linux-musl, x86_64-apple-darwin
 curl -fsSL "https://github.com/gotempsh/autopack/releases/download/v${VERSION}/autopack-${VERSION}-${TARGET}.tar.gz" \
   | tar -xz --strip-components=1 -C /usr/local/bin "autopack-${VERSION}-${TARGET}/autopack"
@@ -192,8 +192,8 @@ Detected:
   mainPackage    .
 Steps:
   packages
-    $ apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git && rm -rf /var/lib/apt/lists/*
-    $ curl -fsSL https://mise.run | MISE_VERSION=v2026.7.18 sh
+    $ apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git gnupg && rm -rf /var/lib/apt/lists/*
+    $ download and verify the signed mise v2026.7.18 installer, then run it
     $ create /mise/config.toml
     $ mise install && mise reshim
     $ PATH += /mise/shims

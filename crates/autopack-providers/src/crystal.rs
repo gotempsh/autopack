@@ -5,7 +5,7 @@ use autopack_core::{steps, App, BuildContext, Environment, Error, Provider, Resu
 
 use crate::support::{
     install_recorded_runtime_libraries, procfile_web_command, record_runtime_libraries,
-    RUNTIME_DEPS_FILE,
+    ELF_INSPECTION_PACKAGE, RUNTIME_DEPS_FILE,
 };
 
 /// Crystal release used when the project does not pin one.
@@ -47,6 +47,8 @@ impl Provider for CrystalProvider {
         // family as the builder or the glibc versions will not match.
         ctx.set_runtime_base_image(&image);
         ctx.set_runtime_includes_runtimes(false);
+        ctx.build_apt_packages
+            .push(ELF_INSPECTION_PACKAGE.to_string());
 
         ctx.add_metadata("crystalVersion", &version);
         ctx.add_metadata("entrypoint", &entry);

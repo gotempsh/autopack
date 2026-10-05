@@ -10,12 +10,28 @@ use autopack_core::plan::{Command, Layer};
 use autopack_core::{steps, App, BuildContext, Environment, Provider, Result, APP_DIR};
 
 use crate::support::{
-    caddy_layer, caddy_start_command, caddyfile, normalize_version_range, procfile_web_command,
-    read_version_file, CADDYFILE_PATH,
+    caddy_layer, caddy_start_command, caddyfile, install_recorded_runtime_libraries,
+    normalize_version_range, procfile_web_command, read_version_file,
+    record_runtime_libraries_from_command, CADDYFILE_PATH, ELF_INSPECTION_PACKAGE,
+    RUNTIME_DEPS_FILE,
 };
 
 /// Where a Next.js standalone bundle is staged for the runtime image.
 const STANDALONE_DIR: &str = "/app/standalone";
+
+/// Directory Playwright keeps browsers in when `PLAYWRIGHT_BROWSERS_PATH=0`
+/// asks for an install beside the package.
+const PLAYWRIGHT_BROWSERS: &str = ".local-browsers";
+
+/// Fonts a browser needs but never links.
+///
+/// Everything else Chromium requires is a `DT_NEEDED` entry, so `readelf` finds it
+/// — measured against Chrome for Testing: with the discovered set installed
+/// there are zero unresolved libraries and it renders, screenshots and prints.
+/// Fonts are the exception. They are opened through fontconfig at run time, so
+/// no amount of inspecting the binary reveals them, and a browser without them
+/// draws text as empty boxes rather than failing in a way anyone would notice.
+const CHROMIUM_FONTS: &[&str] = &["fonts-liberation"];
 
 /// Node version used when the app does not pin one.
 const DEFAULT_NODE_VERSION: &str = "24";
@@ -136,6 +152,14 @@ impl Provider for NodeProvider {
         let browsers = browser_tooling(&package);
         ctx.deploy_apt_packages
             .extend(browsers.runtime_packages.iter().cloned());
+        if !browsers.browser_searches.is_empty() {
+            ctx.build_apt_packages
+                .push(ELF_INSPECTION_PACKAGE.to_string());
+            ctx.add_runtime_input(Layer::step(steps::INSTALL).including([RUNTIME_DEPS_FILE]));
+            ctx.add_runtime_command(Command::shell(install_recorded_runtime_libraries(
+                RUNTIME_DEPS_FILE,
+            )));
+        }
         if !browsers.is_empty() {
             ctx.add_metadata("browser", "chromium");
         }
@@ -144,7 +168,7 @@ impl Provider for NodeProvider {
         }
 
         self.plan_install(ctx, &package, manager, &browsers)?;
-        self.plan_build(ctx, &package, manager, &browsers)?;
+        self.plan_build(ctx, &package, manager, framework, &browsers)?;
 
         let static_site = static_site(ctx, &package, framework);
         // Deferred until the deploy path is known: a static site serves with
@@ -221,6 +245,32 @@ impl NodeProvider {
         for download in &browsers.downloads {
             step.add_command(Command::shell(download.clone()));
         }
+        // Ask the browser what it links rather than carrying a list. The
+        // hardcoded closure was a hand-maintained union across two Chrome
+        // binaries, wrong in both directions — it missed seven libraries apt
+        // happened to pull in transitively, and its names are bookworm's, so
+        // it breaks on a base image bump.
+        if !browsers.browser_searches.is_empty() {
+            let search = browsers.browser_searches.join("; ");
+            // Nothing downstream notices an empty result: no binaries means no
+            // libraries recorded, the runtime stage skips its install, and the
+            // image looks fine until the first time it opens a browser. Stop
+            // here, where the message can say what was searched.
+            step.add_command(Command::shell(format!(
+                "set -eu; \
+                 if [ -z \"$({search})\" ]; then \
+                   echo 'autopack: the install step downloaded no browser' >&2; \
+                   echo 'Searched: {search}' >&2; \
+                   echo 'If the download was skipped (PUPPETEER_SKIP_DOWNLOAD, \
+PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD), either unset it or drop the dependency.' >&2; \
+                   exit 1; \
+                 fi"
+            )));
+            step.add_command(Command::shell(record_runtime_libraries_from_command(
+                &search,
+                RUNTIME_DEPS_FILE,
+            )));
+        }
         Ok(())
     }
 
@@ -231,14 +281,62 @@ impl NodeProvider {
         ctx: &mut BuildContext<'_>,
         package: &PackageJson,
         manager: PackageManager,
+        framework: Framework,
         browsers: &BrowserTooling,
     ) -> Result<()> {
         let build_script = package
             .script("build")
             .map(|_| manager.run_command("build"));
+        let (node_version, _) = node_version(ctx.app, package)?;
+        let legacy_openssl = needs_legacy_openssl(package, &node_version);
 
+        // Cache each Next package at its own build directory, including root
+        // scripts that delegate to workspace apps. Scope locks to the source
+        // checkout so unrelated applications never serialize on one mount.
+        let mut next_directories = Vec::new();
+        if build_script.is_some() {
+            if framework == Framework::Next {
+                next_directories.push(APP_DIR.to_string());
+            }
+            for manifest in ctx.app.find_files("**/package.json")? {
+                if manifest == "package.json" {
+                    continue;
+                }
+                let child: PackageJson = match ctx.app.read_json(&manifest) {
+                    Ok(package) => package,
+                    Err(_) => continue,
+                };
+                if child.has_dependency("next") {
+                    let directory = manifest.trim_end_matches("/package.json");
+                    next_directories.push(format!("{APP_DIR}/{directory}"));
+                }
+            }
+        }
+        let identity = ctx.app.source().to_string_lossy();
+        // Stable FNV-1a digest: cache names contain no host path or shell input.
+        let scope = identity.bytes().fold(0xcbf29ce484222325u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+        });
+        let caches: Vec<_> = next_directories
+            .into_iter()
+            .map(|directory| {
+                let package_scope = directory.bytes().fold(scope, |hash, byte| {
+                    (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+                });
+                ctx.locked_cache(
+                    format!("next-cache-{package_scope:016x}"),
+                    format!("{directory}/.next/cache"),
+                )
+            })
+            .collect();
         let step = ctx.step(steps::BUILD);
+        for cache in caches {
+            step.add_cache(cache);
+        }
         step.inputs = vec![Layer::step(steps::INSTALL), Layer::local()];
+        if legacy_openssl {
+            step.add_variable("NODE_OPTIONS", LEGACY_OPENSSL_OPTION);
+        }
         // `pnpm run` may re-invoke install for a deps check; same no-TTY rule.
         if manager == PackageManager::Pnpm {
             step.add_variable("CI", "true");
@@ -461,6 +559,102 @@ fn static_site(
     }
 }
 
+/// What a non-Node provider learns from [`plan_front_end`].
+pub(crate) struct FrontEnd {
+    /// The package manager the app uses.
+    pub(crate) manager: PackageManager,
+    /// Whether `package.json` defines a `build` script.
+    pub(crate) has_build_script: bool,
+}
+
+/// Install Node, the app's package manager and its JavaScript dependencies in
+/// `step_name`, for an app another provider builds.
+///
+/// Server frameworks compile their front end with Node during their own build
+/// — Laravel through Vite or Mix, Rails through jsbundling, cssbundling or
+/// Webpacker — and all of it fails without `node` and `node_modules`. The
+/// commands are added to the step before the provider's own, so the
+/// dependencies are in place when its asset task runs. Returns `None` when the
+/// app has no `package.json`.
+pub(crate) fn plan_front_end(
+    ctx: &mut BuildContext<'_>,
+    step_name: &str,
+) -> Result<Option<FrontEnd>> {
+    let Some(package) = ctx.app.read_json_opt::<PackageJson>("package.json")? else {
+        return Ok(None);
+    };
+    let manager = PackageManager::detect(ctx.app, &package);
+    let (node_version, version_source) = node_version(ctx.app, &package)?;
+    ctx.packages.add("node", &node_version, version_source);
+    if let Some((tool, version)) = manager.mise_tool(&package) {
+        ctx.packages.add(tool, version, "packageManager / lockfile");
+    }
+    if manager.needs_libatomic(&package, ctx.lock()) {
+        ctx.build_apt_packages.push("libatomic1".to_string());
+    }
+    ctx.add_metadata("frontEnd", manager.id());
+    ctx.add_metadata("nodeVersion", &node_version);
+
+    let install = manager.install_command(ctx.app, &package, ctx.lock());
+    let legacy_openssl = needs_legacy_openssl(&package, &node_version);
+    let (cache_dir, cache_env) = manager.cache();
+    let cache = ctx.shared_cache(format!("{}-store", manager.id()), cache_dir);
+
+    let step = ctx.step(step_name);
+    step.add_cache(cache);
+    for (key, value) in cache_env {
+        step.add_variable(key, value);
+    }
+    if manager == PackageManager::Pnpm {
+        // Docker RUN has no TTY; pnpm prompts to purge node_modules otherwise.
+        step.add_variable("CI", "true");
+    }
+    if legacy_openssl {
+        step.add_variable("NODE_OPTIONS", LEGACY_OPENSSL_OPTION);
+    }
+    step.add_command(Command::shell(install));
+
+    Ok(Some(FrontEnd {
+        manager,
+        has_build_script: package.script("build").is_some(),
+    }))
+}
+
+/// Lets webpack 4 hash with MD4 on Node 17+, whose OpenSSL 3 dropped it.
+const LEGACY_OPENSSL_OPTION: &str = "--openssl-legacy-provider";
+
+/// Whether the build runs webpack 4 on a Node new enough to need
+/// [`LEGACY_OPENSSL_OPTION`].
+///
+/// Webpack 4 hashes modules with MD4, which OpenSSL 3 (Node 17+) no longer
+/// provides; the build dies with `ERR_OSSL_EVP_UNSUPPORTED`. It arrives
+/// directly or through the toolchains built on it: Webpacker 5 and older,
+/// Create React App 4, Vue CLI 4 and Laravel Mix 5. Node 16 and older reject
+/// the flag outright, so it is only set when the Node being installed has it.
+fn needs_legacy_openssl(package: &PackageJson, node_version: &str) -> bool {
+    let major = |name: &str| {
+        package
+            .dependencies
+            .get(name)
+            .or_else(|| package.dev_dependencies.get(name))
+            .and_then(|range| {
+                crate::version::Version::parse(
+                    range.trim_start_matches(|c: char| !c.is_ascii_digit()),
+                )
+            })
+            .map(|version| version.major)
+    };
+    let webpack4 = major("webpack").is_some_and(|m| m <= 4)
+        || major("@rails/webpacker").is_some_and(|m| m <= 5)
+        || major("react-scripts").is_some_and(|m| m <= 4)
+        || major("@vue/cli-service").is_some_and(|m| m <= 4)
+        || major("laravel-mix").is_some_and(|m| m <= 5);
+    // An alias (`lts`, `latest`) is always a current release.
+    let modern_node =
+        crate::version::Version::parse(node_version).is_none_or(|version| version.major >= 17);
+    webpack4 && modern_node
+}
+
 /// The Node version to install, and where it was found.
 fn node_version(app: &App, package: &PackageJson) -> Result<(String, String)> {
     for file in [".nvmrc", ".node-version"] {
@@ -483,8 +677,15 @@ fn node_version(app: &App, package: &PackageJson) -> Result<(String, String)> {
 /// Browser tooling an app needs wired up: the system libraries the browser
 /// links against, where it is cached, and how it is fetched.
 struct BrowserTooling {
-    /// Debian packages the runtime image needs.
+    /// Debian packages the runtime image needs that ELF inspection cannot discover.
+    ///
+    /// Fonts only. A browser does not link them — it opens them through
+    /// fontconfig at run time — so nothing about the binary reveals that they
+    /// are needed, and without them Chromium renders text as empty boxes
+    /// instead of failing in a way anyone would notice.
     runtime_packages: Vec<String>,
+    /// Shell expressions that list the browser binaries to inspect.
+    browser_searches: Vec<String>,
     /// Environment for the install, build and runtime stages.
     variables: Vec<(&'static str, String)>,
     /// Commands the install step runs after dependencies are in place.
@@ -529,6 +730,7 @@ impl BrowserTooling {
 fn browser_tooling(package: &PackageJson) -> BrowserTooling {
     let mut tooling = BrowserTooling {
         runtime_packages: Vec::new(),
+        browser_searches: Vec::new(),
         variables: Vec::new(),
         downloads: Vec::new(),
     };
@@ -559,8 +761,31 @@ fn browser_tooling(package: &PackageJson) -> BrowserTooling {
             .variables
             .push(("PUPPETEER_CACHE_DIR", format!("{APP_DIR}/.cache/puppeteer")));
     }
+    // `find` rather than a positional glob. pnpm does not hoist
+    // `playwright-core` to the top of node_modules — the browsers land under
+    // `.pnpm/playwright-core@1.62.1/node_modules/...` — so a glob written for
+    // npm's layout matches nothing there, and matching nothing is silent: the
+    // recorded list comes out empty and the image ships with no browser
+    // libraries at all.
+    //
+    // Both binaries are collected. Playwright launches the headless shell by
+    // default and Puppeteer the full browser, they sit in differently named
+    // directories, and their link sets are not identical.
+    if playwright {
+        tooling.browser_searches.push(format!(
+            "find {APP_DIR}/node_modules -path '*/{PLAYWRIGHT_BROWSERS}/*' -type f \\
+             \\( -name chrome -o -name chrome-headless-shell -o -name headless_shell \\) \\
+             2>/dev/null"
+        ));
+    }
+    if puppeteer {
+        tooling.browser_searches.push(format!(
+            "find {APP_DIR}/.cache/puppeteer -type f \\
+             \\( -name chrome -o -name chrome-headless-shell \\) 2>/dev/null"
+        ));
+    }
     if playwright || puppeteer {
-        tooling.runtime_packages = crate::native::CHROMIUM_RUNTIME
+        tooling.runtime_packages = CHROMIUM_FONTS
             .iter()
             .map(|package| (*package).to_string())
             .collect();
@@ -584,8 +809,61 @@ fn is_simple_command(script: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::{needs_legacy_openssl, PackageJson, PLAYWRIGHT_BROWSERS, RUNTIME_DEPS_FILE};
     use crate::test_support::{plan_for, plan_with_env, write_app};
     use autopack_core::APP_DIR;
+
+    #[test]
+    fn webpack_4_toolchains_get_the_legacy_openssl_provider_on_modern_node() {
+        let package = |deps: &str| -> PackageJson {
+            serde_json::from_str(&format!(r#"{{"dependencies":{{{deps}}}}}"#)).unwrap()
+        };
+        assert!(needs_legacy_openssl(
+            &package(r#""react-scripts":"4.0.3""#),
+            "24"
+        ));
+        assert!(needs_legacy_openssl(
+            &package(r#""@rails/webpacker":"^5.4.0""#),
+            "lts"
+        ));
+        assert!(needs_legacy_openssl(
+            &package(r#""webpack":"^4.46.0""#),
+            "20"
+        ));
+        assert!(needs_legacy_openssl(
+            &package(r#""laravel-mix":"^5.0.1""#),
+            "18"
+        ));
+        // Node 16 rejects the flag, and webpack 5 does not need it.
+        assert!(!needs_legacy_openssl(
+            &package(r#""react-scripts":"4.0.3""#),
+            "16"
+        ));
+        assert!(!needs_legacy_openssl(
+            &package(r#""webpack":"^5.90.0""#),
+            "24"
+        ));
+        assert!(!needs_legacy_openssl(
+            &package(r#""react-scripts":"5.0.1""#),
+            "24"
+        ));
+    }
+
+    #[test]
+    fn a_create_react_app_4_build_sets_the_legacy_openssl_provider() {
+        let (_dir, app) = write_app(&[
+            (
+                "package.json",
+                r#"{"scripts":{"build":"react-scripts build"},"dependencies":{"react-scripts":"4.0.3"}}"#,
+            ),
+            ("package-lock.json", "{}"),
+        ]);
+        let plan = plan_for(&app).plan;
+        assert_eq!(
+            plan.step("build").unwrap().variables["NODE_OPTIONS"],
+            "--openssl-legacy-provider"
+        );
+    }
 
     #[test]
     fn detects_npm_and_plans_install_and_build() {
@@ -694,6 +972,99 @@ mod tests {
             Some("next start")
         );
         assert_eq!(analysis.plan.deploy.variables["NODE_ENV"], "production");
+    }
+
+    #[test]
+    fn next_build_reuses_a_locked_next_cache() {
+        let (_dir, app) = write_app(&[(
+            "package.json",
+            r#"{"dependencies":{"next":"15"},"scripts":{"build":"next build","start":"next start"}}"#,
+        )]);
+        let analysis = plan_for(&app);
+
+        let build = analysis.plan.step("build").unwrap();
+        assert!(
+            build
+                .caches
+                .iter()
+                .any(|name| name.starts_with("next-cache-")),
+            "build step caches: {:?}",
+            build.caches
+        );
+        let cache = &analysis.plan.caches[&build.caches[0]];
+        assert_eq!(cache.directory, format!("{APP_DIR}/.next/cache"));
+        assert_eq!(cache.cache_type, autopack_core::plan::CacheType::Locked);
+    }
+
+    #[test]
+    fn next_caches_are_stable_and_isolated_between_checkouts() {
+        let manifest = r#"{"dependencies":{"next":"15"},"scripts":{"build":"next build","start":"next start"}}"#;
+        let (_first, app) = write_app(&[("package.json", manifest)]);
+        let (_second, other) = write_app(&[("package.json", manifest)]);
+        let names =
+            |app: &autopack_core::App| plan_for(app).plan.step("build").unwrap().caches.clone();
+        assert_eq!(names(&app), names(&app));
+        assert_ne!(names(&app), names(&other));
+    }
+
+    #[test]
+    fn delegated_workspace_build_caches_each_next_package() {
+        let (_dir, app) = write_app(&[
+            (
+                "package.json",
+                r#"{"workspaces":["apps/*"],"scripts":{"build":"cd apps/web && npm run build","start":"cd apps/web && npm start"}}"#,
+            ),
+            (
+                "apps/web/package.json",
+                r#"{"dependencies":{"next":"15"},"scripts":{"build":"next build"}}"#,
+            ),
+            (
+                "apps/admin/package.json",
+                r#"{"dependencies":{"next":"15"}}"#,
+            ),
+            (
+                "apps/other/package.json",
+                r#"{"dependencies":{"vite":"5"}}"#,
+            ),
+        ]);
+        let analysis = plan_for(&app);
+        let build = analysis.plan.step("build").unwrap();
+        let directories: Vec<_> = build
+            .caches
+            .iter()
+            .map(|name| analysis.plan.caches[name].directory.as_str())
+            .collect();
+        assert_eq!(
+            directories,
+            ["/app/apps/admin/.next/cache", "/app/apps/web/.next/cache"]
+        );
+        let web_cache = build
+            .caches
+            .iter()
+            .find(|name| analysis.plan.caches[*name].directory == "/app/apps/web/.next/cache")
+            .unwrap();
+        std::fs::create_dir_all(app.path("apps/aaa")).unwrap();
+        std::fs::write(
+            app.path("apps/aaa/package.json"),
+            r#"{"dependencies":{"next":"15"}}"#,
+        )
+        .unwrap();
+        let refreshed = autopack_core::App::new(app.source()).unwrap();
+        let updated = plan_for(&refreshed);
+        assert_eq!(
+            updated.plan.caches[web_cache].directory,
+            "/app/apps/web/.next/cache"
+        );
+    }
+
+    #[test]
+    fn non_next_builds_get_no_next_cache() {
+        let (_dir, app) = write_app(&[(
+            "package.json",
+            r#"{"dependencies":{"vite":"5"},"scripts":{"build":"vite build"}}"#,
+        )]);
+        let analysis = plan_for(&app);
+        assert!(!analysis.plan.caches.contains_key("next-cache"));
     }
 
     #[test]
@@ -930,7 +1301,7 @@ mod tests {
     }
 
     #[test]
-    fn playwright_gets_the_chromium_libraries_and_an_in_app_browser_cache() {
+    fn playwright_discovers_its_libraries_and_gets_an_in_app_browser_cache() {
         // The browser is downloaded during install. Left at its default
         // location it lands under $HOME, which the deploy layer never carries
         // — and the build runs as root while the runtime user is `autopack`,
@@ -945,11 +1316,32 @@ mod tests {
         ]);
         let analysis = plan_for(&app);
 
+        // No hardcoded library closure: the runtime image installs whatever
+        // static ELF inspection found the browser to link, plus fonts, which are opened
+        // through fontconfig and so are invisible to the linker.
         let runtime = analysis.plan.step("runtime").unwrap();
+        let apt = runtime.commands[0].display_name();
+        assert!(apt.contains("fonts-liberation"), "{apt}");
+        assert!(!apt.contains("libnss3"), "{apt}");
         assert!(
-            runtime.commands[0].display_name().contains("libnss3"),
-            "{}",
-            runtime.commands[0].display_name()
+            runtime
+                .commands
+                .iter()
+                .any(|c| c.display_name().contains(RUNTIME_DEPS_FILE)),
+            "runtime does not install the recorded libraries"
+        );
+        assert!(
+            analysis
+                .plan
+                .step("install")
+                .unwrap()
+                .commands
+                .iter()
+                .any(|c| {
+                    c.display_name().contains("readelf ")
+                        && c.display_name().contains(PLAYWRIGHT_BROWSERS)
+                }),
+            "install step does not inspect the browser"
         );
 
         for step in ["install", "build"] {
@@ -1057,7 +1449,7 @@ mod tests {
             assert!(
                 !analysis.plan.step("runtime").unwrap().commands[0]
                     .display_name()
-                    .contains("libnss3"),
+                    .contains("fonts-liberation"),
                 "{manifest}"
             );
         }
@@ -1077,9 +1469,8 @@ mod tests {
             ("index.html", ""),
         ]);
         let analysis = plan_for(&app);
-        assert!(!analysis.plan.step("runtime").unwrap().commands[0]
-            .display_name()
-            .contains("libnss3"));
+        let apt = analysis.plan.step("runtime").unwrap().commands[0].display_name();
+        assert!(!apt.contains("fonts-liberation"), "{apt}");
         assert!(!analysis
             .plan
             .step("install")
@@ -1087,6 +1478,68 @@ mod tests {
             .commands
             .iter()
             .any(|c| c.display_name().contains("playwright install")));
+    }
+
+    #[test]
+    fn a_missing_browser_fails_the_build_rather_than_the_container() {
+        // A search that finds nothing is silent: no libraries are recorded,
+        // the runtime stage skips its install, and the image dies the first
+        // time it opens a browser. pnpm hits exactly this — it does not hoist
+        // playwright-core, so a glob written for npm's layout finds nothing.
+        let (_dir, app) = write_app(&[
+            (
+                "package.json",
+                r#"{"dependencies":{"puppeteer":"^24.0.0"},"scripts":{"start":"node s.js"}}"#,
+            ),
+            ("package-lock.json", "{}"),
+            ("s.js", ""),
+        ]);
+        let analysis = plan_for(&app);
+        let install = analysis.plan.step("install").unwrap();
+        let names: Vec<_> = install.commands.iter().map(|c| c.display_name()).collect();
+
+        let guard = names
+            .iter()
+            .position(|n| n.contains("downloaded no browser"))
+            .expect("no guard against a missing browser");
+        assert!(names[guard].contains("exit 1"));
+        assert!(names[guard].contains("SKIP_DOWNLOAD"));
+
+        // The guard has to run before the inspection it protects.
+        let record = names.iter().position(|n| n.contains("readelf ")).unwrap();
+        assert!(guard < record, "{names:?}");
+    }
+
+    #[test]
+    fn browser_discovery_does_not_assume_a_hoisted_layout() {
+        // pnpm puts the browsers under
+        // node_modules/.pnpm/playwright-core@1.62.1/node_modules/... — a
+        // positional glob written for npm finds nothing there, and finding
+        // nothing produced an image with no browser libraries and a build
+        // that exited 0.
+        let (_dir, app) = write_app(&[
+            (
+                "package.json",
+                r#"{"dependencies":{"playwright":"^1.62.1"},"scripts":{"start":"node s.js"}}"#,
+            ),
+            ("pnpm-lock.yaml", ""),
+            ("s.js", ""),
+        ]);
+        let analysis = plan_for(&app);
+        let record = analysis
+            .plan
+            .step("install")
+            .unwrap()
+            .commands
+            .iter()
+            .map(|c| c.display_name())
+            .find(|n| n.contains("readelf "))
+            .expect("no discovery command");
+        assert!(record.contains("find "), "{record}");
+        // Both binaries: Playwright launches the headless shell by default,
+        // Puppeteer the full browser, and they do not link the same set.
+        assert!(record.contains("-name chrome-headless-shell"), "{record}");
+        assert!(record.contains("-name chrome "), "{record}");
     }
 
     #[test]
@@ -1103,9 +1556,8 @@ mod tests {
         let install = analysis.plan.step("install").unwrap();
         assert!(install.variables.get("PLAYWRIGHT_BROWSERS_PATH").is_none());
         assert!(install.variables.get("PUPPETEER_CACHE_DIR").is_none());
-        assert!(!analysis.plan.step("runtime").unwrap().commands[0]
-            .display_name()
-            .contains("libnss3"));
+        let apt = analysis.plan.step("runtime").unwrap().commands[0].display_name();
+        assert!(!apt.contains("fonts-liberation"), "{apt}");
     }
 
     #[test]
