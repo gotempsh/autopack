@@ -288,15 +288,45 @@ PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD), either unset it or drop the dependency.' >&2;
             .script("build")
             .map(|_| manager.run_command("build"));
 
-        // `next build` keeps its compiler and image caches in `.next/cache`
-        // and reuses them on the next build. Without a cache mount that
-        // directory starts empty every time. Locked: concurrent writers can
-        // corrupt it. Being a mount, it also stays out of the image.
-        let next_cache = (framework == Framework::Next && build_script.is_some())
-            .then(|| ctx.locked_cache("next-cache", format!("{APP_DIR}/.next/cache")));
-
+        // Cache each Next package at its own build directory, including root
+        // scripts that delegate to workspace apps. Scope locks to the source
+        // checkout so unrelated applications never serialize on one mount.
+        let mut next_directories = Vec::new();
+        if build_script.is_some() {
+            if framework == Framework::Next {
+                next_directories.push(APP_DIR.to_string());
+            }
+            for manifest in ctx.app.find_files("**/package.json")? {
+                if manifest == "package.json" {
+                    continue;
+                }
+                let child: PackageJson = match ctx.app.read_json(&manifest) {
+                    Ok(package) => package,
+                    Err(_) => continue,
+                };
+                if child.has_dependency("next") {
+                    let directory = manifest.trim_end_matches("/package.json");
+                    next_directories.push(format!("{APP_DIR}/{directory}"));
+                }
+            }
+        }
+        let identity = ctx.app.source().to_string_lossy();
+        // Stable FNV-1a digest: cache names contain no host path or shell input.
+        let scope = identity.bytes().fold(0xcbf29ce484222325u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+        });
+        let caches: Vec<_> = next_directories
+            .into_iter()
+            .enumerate()
+            .map(|(index, directory)| {
+                ctx.locked_cache(
+                    format!("next-cache-{scope:016x}-{index}"),
+                    format!("{directory}/.next/cache"),
+                )
+            })
+            .collect();
         let step = ctx.step(steps::BUILD);
-        if let Some(cache) = next_cache {
+        for cache in caches {
             step.add_cache(cache);
         }
         step.inputs = vec![Layer::step(steps::INSTALL), Layer::local()];
@@ -799,13 +829,60 @@ mod tests {
 
         let build = analysis.plan.step("build").unwrap();
         assert!(
-            build.caches.iter().any(|name| name == "next-cache"),
+            build
+                .caches
+                .iter()
+                .any(|name| name.starts_with("next-cache-")),
             "build step caches: {:?}",
             build.caches
         );
-        let cache = &analysis.plan.caches["next-cache"];
+        let cache = &analysis.plan.caches[&build.caches[0]];
         assert_eq!(cache.directory, format!("{APP_DIR}/.next/cache"));
         assert_eq!(cache.cache_type, autopack_core::plan::CacheType::Locked);
+    }
+
+    #[test]
+    fn next_caches_are_stable_and_isolated_between_checkouts() {
+        let manifest = r#"{"dependencies":{"next":"15"},"scripts":{"build":"next build","start":"next start"}}"#;
+        let (_first, app) = write_app(&[("package.json", manifest)]);
+        let (_second, other) = write_app(&[("package.json", manifest)]);
+        let names =
+            |app: &autopack_core::App| plan_for(app).plan.step("build").unwrap().caches.clone();
+        assert_eq!(names(&app), names(&app));
+        assert_ne!(names(&app), names(&other));
+    }
+
+    #[test]
+    fn delegated_workspace_build_caches_each_next_package() {
+        let (_dir, app) = write_app(&[
+            (
+                "package.json",
+                r#"{"workspaces":["apps/*"],"scripts":{"build":"cd apps/web && npm run build","start":"cd apps/web && npm start"}}"#,
+            ),
+            (
+                "apps/web/package.json",
+                r#"{"dependencies":{"next":"15"},"scripts":{"build":"next build"}}"#,
+            ),
+            (
+                "apps/admin/package.json",
+                r#"{"dependencies":{"next":"15"}}"#,
+            ),
+            (
+                "apps/other/package.json",
+                r#"{"dependencies":{"vite":"5"}}"#,
+            ),
+        ]);
+        let analysis = plan_for(&app);
+        let build = analysis.plan.step("build").unwrap();
+        let directories: Vec<_> = build
+            .caches
+            .iter()
+            .map(|name| analysis.plan.caches[name].directory.as_str())
+            .collect();
+        assert_eq!(
+            directories,
+            ["/app/apps/admin/.next/cache", "/app/apps/web/.next/cache"]
+        );
     }
 
     #[test]
