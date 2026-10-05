@@ -10,6 +10,7 @@ homepage.workspace = true
 authors.workspace = true
 
 [dependencies]
+cap-std = "4"
 globset.workspace = true
 indexmap.workspace = true
 serde.workspace = true

@@ -5,6 +5,7 @@
 //! deterministic (results are sorted), and testable without touching disk
 //! layout details in every provider.
 
+#[cfg(test)]
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -58,6 +59,7 @@ pub(crate) fn resolve_within(root: &Path, relative: &Path) -> Option<PathBuf> {
 /// A source directory being analysed.
 pub struct App {
     source: PathBuf,
+    directory: cap_std::fs::Dir,
     /// Relative, `/`-separated paths of every indexed file, sorted.
     files: OnceLock<Vec<String>>,
 }
@@ -79,9 +81,18 @@ impl App {
         }
         let source = source
             .canonicalize()
-            .unwrap_or_else(|_| source.to_path_buf());
+            .map_err(|source_error| Error::ReadFile {
+                path: source.to_path_buf(),
+                source: source_error,
+            })?;
+        let directory = cap_std::fs::Dir::open_ambient_dir(&source, cap_std::ambient_authority())
+            .map_err(|source_error| Error::ReadFile {
+            path: source.clone(),
+            source: source_error,
+        })?;
         Ok(Self {
             source,
+            directory,
             files: OnceLock::new(),
         })
     }
@@ -103,14 +114,22 @@ impl App {
     ///
     /// A symlink or `..` path that leads out of the tree counts as absent.
     pub fn has_file(&self, relative: impl AsRef<Path>) -> bool {
-        resolve_within(&self.source, relative.as_ref()).is_some_and(|path| path.is_file())
+        resolve_within(&self.source, relative.as_ref()).is_some_and(|path| {
+            self.directory
+                .metadata(path.strip_prefix(&self.source).unwrap())
+                .is_ok_and(|metadata| metadata.is_file())
+        })
     }
 
     /// True when `relative` exists inside the source tree and is a directory.
     ///
     /// A symlink or `..` path that leads out of the tree counts as absent.
     pub fn has_dir(&self, relative: impl AsRef<Path>) -> bool {
-        resolve_within(&self.source, relative.as_ref()).is_some_and(|path| path.is_dir())
+        resolve_within(&self.source, relative.as_ref()).is_some_and(|path| {
+            self.directory
+                .metadata(path.strip_prefix(&self.source).unwrap())
+                .is_ok_and(|metadata| metadata.is_dir())
+        })
     }
 
     /// True when any of `candidates` exists as a file.
@@ -170,7 +189,12 @@ impl App {
                 "the path leads outside the source directory",
             )));
         }
-        fs::read_to_string(resolved).map_err(read_error)
+        // Open beneath the retained directory handle, never through the ambient
+        // resolved path. A concurrent directory/symlink replacement cannot
+        // redirect this open outside the source capability.
+        self.directory
+            .read_to_string(resolved.strip_prefix(&self.source).unwrap())
+            .map_err(read_error)
     }
 
     /// Read `relative` as UTF-8, or `None` when it does not exist.
@@ -287,6 +311,56 @@ mod tests {
             fs::write(full, contents).unwrap();
         }
         dir
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_directory_swaps_never_read_outside_contents() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("config")).unwrap();
+        fs::write(root.path().join("config/value"), "inside").unwrap();
+        fs::write(outside.path().join("value"), "outside-secret").unwrap();
+        let app = App::new(root.path()).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let base = root.path().to_path_buf();
+        let external = outside.path().to_path_buf();
+        let worker = std::thread::spawn(move || {
+            while !worker_stop.load(Ordering::Relaxed) {
+                fs::rename(base.join("config"), base.join("parked")).unwrap();
+                std::os::unix::fs::symlink(&external, base.join("config")).unwrap();
+                fs::remove_file(base.join("config")).unwrap();
+                fs::rename(base.join("parked"), base.join("config")).unwrap();
+            }
+        });
+        let mut leaked = false;
+        for _ in 0..2000 {
+            if let Ok(value) = app.read_file("config/value") {
+                leaked |= value != "inside";
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        worker.join().unwrap();
+        assert!(!leaked, "read escaped the retained source directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacing_the_source_path_does_not_replace_its_capability() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("source");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("value"), "original").unwrap();
+        let app = App::new(&root).unwrap();
+        fs::rename(&root, parent.path().join("retained")).unwrap();
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("value"), "replacement").unwrap();
+        assert_eq!(app.read_file("value").unwrap(), "original");
     }
 
     #[test]
