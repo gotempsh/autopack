@@ -235,6 +235,10 @@ fn render_deploy(out: &mut String, plan: &BuildPlan, final_stage: &str) -> Resul
     let _ = writeln!(out, "FROM {base} AS {final_stage}");
     let _ = writeln!(out, "WORKDIR {APP_DIR}");
 
+    if plan.deploy.healthcheck == autopack_core::plan::Healthcheck::Disabled {
+        let _ = writeln!(out, "HEALTHCHECK NONE");
+    }
+
     // Ownership is applied while copying rather than with a later `chown -R`,
     // which would duplicate every copied file into a second layer.
     let chown = plan
@@ -591,6 +595,17 @@ mod tests {
         assert!(dockerfile.contains("COPY . /app"));
         assert!(dockerfile.contains(r#"ENTRYPOINT ["/usr/bin/tini", "-g", "--"]"#));
         assert!(dockerfile.contains(r#"CMD ["/bin/sh", "-c", "exec node dist/index.js"]"#));
+    }
+
+    #[test]
+    fn php_disables_only_the_final_images_incompatible_health_probe() {
+        let dockerfile = dockerfile_for(&[("index.php", "<?php echo 'ok';")]);
+        let (build, runtime) = dockerfile.split_once("# ---- runtime image ----").unwrap();
+        assert!(!build.contains("HEALTHCHECK NONE"));
+        assert!(runtime.contains("HEALTHCHECK NONE"));
+        assert!(runtime.contains("frankenphp run --config /app/Caddyfile"));
+        let node = dockerfile_for(&[("package.json", r#"{"scripts":{"start":"node server.js"}}"#)]);
+        assert!(!node.contains("HEALTHCHECK NONE"));
     }
 
     #[test]

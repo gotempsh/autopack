@@ -132,6 +132,7 @@ impl RailpackConfig {
         if let Some(deploy) = &self.deploy {
             config.deploy_apt_packages = deploy.apt_packages.clone();
             config.deploy = Some(DeployPatch {
+                healthcheck: None,
                 base: deploy.base.clone(),
                 inputs: deploy.inputs.clone(),
                 start_command: deploy.start_command.clone(),
