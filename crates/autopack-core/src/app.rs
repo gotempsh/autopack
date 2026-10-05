@@ -44,6 +44,10 @@ const MAX_DEPTH: usize = 8;
 /// Upper bound on indexed paths, so a pathological repo cannot stall detection.
 const MAX_ENTRIES: usize = 50_000;
 
+/// A separate work budget bounds directory-heavy trees without charging
+/// empty directories against the existing indexed-file limit.
+const MAX_SCANNED_ENTRIES: usize = 200_000;
+
 /// Acquire the source entry without following a replacement symlink. Its
 /// parent is platform-owned, outside the untrusted repository. Once opened,
 /// all source operations use this directory capability, not its old pathname.
@@ -252,6 +256,7 @@ impl App {
         let mut files = Vec::new();
 
         let mut pending = vec![(PathBuf::new(), 0)];
+        let mut scanned = 0;
         'walk: while let Some((directory, depth)) = pending.pop() {
             let path = if directory.as_os_str().is_empty() {
                 Path::new(".")
@@ -262,6 +267,11 @@ impl App {
                 continue;
             };
             for entry in entries.filter_map(std::result::Result::ok) {
+                scanned += 1;
+                if scanned > MAX_SCANNED_ENTRIES {
+                    tracing::warn!(limit = MAX_SCANNED_ENTRIES, "source indexing reached its traversal work bound; results may be incomplete");
+                    break 'walk;
+                }
                 let name = entry.file_name();
                 let relative = directory.join(&name);
                 let Ok(kind) = entry.file_type() else {
