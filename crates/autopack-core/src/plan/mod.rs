@@ -49,7 +49,7 @@ pub struct BuildPlan {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exclude: Vec<String>,
 
-    /// Token mixed into every cache mount id, isolating this app's caches
+    /// Operator-selected key encoded into every cache mount id, separating this app's caches
     /// from other projects built on the same worker. `None` shares them,
     /// which is the default.
     #[serde(default, skip_serializing_if = "Option::is_none")]

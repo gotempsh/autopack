@@ -381,26 +381,24 @@ impl<'a> BuildContext<'a> {
         self.metadata.insert(key.into(), value.into());
     }
 
-    /// Token that isolates this app's cache mounts, if the operator asked for
-    /// isolation.
+    /// Operator-selected project identity for app-scoped cache reuse.
     ///
-    /// Cache mounts are shared by default, and for a content-addressed package
-    /// store that is the point — it is most of the value of caching at all.
-    /// But the mount is not a tenant boundary: install steps run app-controlled
-    /// code as root and hold the store read-write, so on a worker shared
-    /// between projects that are not mutually trusting, one build writes to a
-    /// store the others read. `AUTOPACK_CACHE_SCOPE=app` opts into per-app
-    /// caches for those operators, at the cost of a cold store per project.
-    ///
-    /// The token is a digest of the app's absolute path rather than the path
-    /// itself, which keeps the id short and free of characters the mount
-    /// syntax would object to.
-    fn cache_scope(&self) -> Option<String> {
-        match self.env.config("CACHE_SCOPE")? {
-            "app" => Some(short_digest(&self.app.source().to_string_lossy())),
-            // "shared" is the default; anything else is treated as such rather
-            // than failing a build over a cache setting.
-            _ => None,
+    /// A checkout path is not an identity: workers can reuse it for different
+    /// projects. Require an explicit stable key when app scoping is requested.
+    /// Cache IDs separate reuse, but are not an access-control boundary.
+    fn cache_scope(&self) -> Result<Option<String>> {
+        match self.env.config("CACHE_SCOPE") {
+            Some("app") => {
+                let key = self.env.config("CACHE_KEY").filter(|key| !key.trim().is_empty())
+                    .ok_or_else(|| Error::InvalidPlan(
+                        "AUTOPACK_CACHE_SCOPE=app requires AUTOPACK_CACHE_KEY: set a stable, unique project identifier".into()
+                    ))?;
+                Ok(Some(key.to_owned()))
+            }
+            None | Some("shared") => Ok(None),
+            Some(_) => Err(Error::InvalidPlan(
+                "AUTOPACK_CACHE_SCOPE must be shared or app".into(),
+            )),
         }
     }
 
@@ -461,7 +459,7 @@ impl<'a> BuildContext<'a> {
 
         let mut plan = BuildPlan::new();
         plan.caches = self.caches.clone();
-        plan.cache_scope = self.cache_scope();
+        plan.cache_scope = self.cache_scope()?;
 
         let needs_packages_step = !self.packages.is_empty() || !self.build_apt_packages.is_empty();
         if needs_packages_step {
@@ -648,20 +646,6 @@ impl<'a> BuildContext<'a> {
         };
         vec![Layer::step(last).with_filter(Filter::include([APP_DIR]))]
     }
-}
-
-/// A short, stable digest of `value`, for use inside a cache mount id.
-///
-/// FNV-1a rather than `DefaultHasher`, whose output Rust does not promise to
-/// keep stable across releases — a cache id that changed when autopack was
-/// rebuilt would silently discard every cache.
-fn short_digest(value: &str) -> String {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in value.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0100_0000_01b3);
-    }
-    format!("{hash:016x}")
 }
 
 /// A single cache-friendly apt invocation.
@@ -889,19 +873,6 @@ mod tests {
     }
 
     #[test]
-    fn cache_scope_is_opt_in_and_stable() {
-        // Default: no token, so every project on a worker shares one store.
-        // That is deliberate — see `cache_scope`.
-        assert_eq!(short_digest("/srv/app-a"), short_digest("/srv/app-a"));
-        assert_ne!(short_digest("/srv/app-a"), short_digest("/srv/app-b"));
-        // Stability matters: a digest that moved between autopack builds
-        // would silently throw away every cache on upgrade.
-        assert_eq!(short_digest("/srv/app-a").len(), 16);
-        assert_eq!(short_digest(""), "cbf29ce484222325");
-        assert_eq!(short_digest("hello"), "a430d84680aabd0b");
-    }
-
-    #[test]
     fn generated_plans_scope_caches_only_when_requested() {
         let first = app_fixture();
         let second = app_fixture();
@@ -909,17 +880,39 @@ mod tests {
         let second_app = App::new(second.path()).unwrap();
         let config = Config::default();
         let shared = Environment::new();
-        let scoped = Environment::from_pairs([("AUTOPACK_CACHE_SCOPE", "app")]);
+        let scoped = Environment::from_pairs([
+            ("AUTOPACK_CACHE_SCOPE", "app"),
+            ("AUTOPACK_CACHE_KEY", "first-project"),
+        ]);
+        let other_scope = Environment::from_pairs([
+            ("AUTOPACK_CACHE_SCOPE", "app"),
+            ("AUTOPACK_CACHE_KEY", "second-project"),
+        ]);
         let mut shared_ctx = BuildContext::new(&first_app, &shared, &config);
         shared_ctx.set_start_command("true");
         assert!(shared_ctx.generate().unwrap().cache_scope.is_none());
         let mut first_ctx = BuildContext::new(&first_app, &scoped, &config);
-        let mut second_ctx = BuildContext::new(&second_app, &scoped, &config);
+        let mut second_ctx = BuildContext::new(&second_app, &other_scope, &config);
         first_ctx.set_start_command("true");
         second_ctx.set_start_command("true");
         let first_scope = first_ctx.generate().unwrap().cache_scope.unwrap();
         let second_scope = second_ctx.generate().unwrap().cache_scope.unwrap();
         assert_ne!(first_scope, second_scope);
+        let mut relocated = BuildContext::new(&second_app, &scoped, &config);
+        relocated.set_start_command("true");
+        assert_eq!(
+            first_scope,
+            relocated.generate().unwrap().cache_scope.unwrap()
+        );
+        for env in [
+            Environment::from_pairs([("AUTOPACK_CACHE_SCOPE", "app")]),
+            Environment::from_pairs([("AUTOPACK_CACHE_SCOPE", "app"), ("AUTOPACK_CACHE_KEY", " ")]),
+            Environment::from_pairs([("AUTOPACK_CACHE_SCOPE", "ap")]),
+        ] {
+            let mut invalid = BuildContext::new(&first_app, &env, &config);
+            invalid.set_start_command("true");
+            assert!(invalid.generate().is_err());
+        }
         assert_eq!(
             first_scope,
             first_ctx.generate().unwrap().cache_scope.unwrap()

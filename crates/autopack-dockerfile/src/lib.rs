@@ -386,13 +386,8 @@ fn mount_flags(plan: &BuildPlan, step: &Step) -> String {
             CacheType::Shared => "shared",
             CacheType::Locked => "locked",
         };
-        // The id is derived from the cache name and its mount point, not from
-        // the app: every project on a builder that caches `/cache/npm` shares
-        // one volume. That is deliberate for a content-addressed package
-        // store, which is built to be shared and is most of the value of
-        // caching at all — but it does mean the mount is not a tenant
-        // boundary, so a build that executes untrusted code is writing to a
-        // store other builds read.
+        // Package stores share IDs by default. An operator-selected scope
+        // separates project cache reuse; it is not an access-control boundary.
         let _ = write!(
             flags,
             " --mount=type=cache,id={id},target={target},sharing={sharing}",
@@ -434,7 +429,11 @@ fn cache_id(name: &str, cache: &Cache, scope: Option<&str>) -> String {
     match scope {
         Some(scope) => format!(
             "autopack-{}-{name}-{}",
-            sanitize(scope),
+            scope
+                .as_bytes()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
             sanitize(&cache.directory)
         ),
         None => format!("autopack-{name}-{}", sanitize(&cache.directory)),
@@ -528,6 +527,14 @@ mod tests {
         let cache = Cache::shared("/cache/npm");
         let id = cache_id("npm-store", &cache, Some("app,target=/etc\nRUN evil"));
         assert!(id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
+        assert_ne!(
+            cache_id("npm-store", &cache, Some("App")),
+            cache_id("npm-store", &cache, Some("app"))
+        );
+        assert_ne!(
+            cache_id("npm-store", &cache, Some("a,b")),
+            cache_id("npm-store", &cache, Some("a-b"))
+        );
     }
 
     #[test]
