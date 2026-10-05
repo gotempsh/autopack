@@ -17,6 +17,7 @@
 //! | other inputs    | `COPY --from=`                          |
 //! | cache           | `RUN --mount=type=cache`                |
 //! | secret          | `RUN --mount=type=secret,env=`          |
+//! | build argument  | `ARG`, in the steps that declare it     |
 //! | asset + file cmd| `COPY <<EOF` heredoc                    |
 //! | deploy          | the final stage, plus `CMD`             |
 
@@ -150,6 +151,12 @@ fn render_step(out: &mut String, plan: &BuildPlan, step: &Step) -> Result<()> {
 
     for input in step.inputs.iter().skip(1) {
         render_overlay(out, input, &step.name)?;
+    }
+
+    // Declared after the inputs so a changed value leaves the copies cached
+    // and only re-runs this step's commands.
+    for name in build_arg_names(plan, step) {
+        let _ = writeln!(out, "ARG {name}");
     }
 
     let mounts = mount_flags(plan, step);
@@ -420,6 +427,18 @@ fn secret_names(plan: &BuildPlan, step: &Step) -> Vec<String> {
         .collect()
 }
 
+/// The build arguments a step declares, with `*` expanded to the plan's list.
+///
+/// `validate` has checked that every name is an identifier the plan declares,
+/// so each one is emitted as written.
+fn build_arg_names(plan: &BuildPlan, step: &Step) -> Vec<String> {
+    if step.uses_all_build_args() {
+        plan.build_args.clone()
+    } else {
+        step.build_args.clone()
+    }
+}
+
 /// Collapse a string onto a single line for use inside a `#` comment.
 fn one_line(value: &str) -> String {
     value.replace(['\n', '\r'], " ").trim_end().to_string()
@@ -628,6 +647,97 @@ mod tests {
         let dockerfile = to_dockerfile(&plan).unwrap();
         assert!(dockerfile
             .contains("--mount=type=secret,id=DATABASE_URL,env=DATABASE_URL,required=false"));
+    }
+
+    /// The lines of the stage that starts with `FROM ... AS {stage}`.
+    fn stage<'a>(dockerfile: &'a str, stage: &str) -> Vec<&'a str> {
+        let header = format!(" AS {stage}");
+        dockerfile
+            .lines()
+            .skip_while(|line| !(line.starts_with("FROM ") && line.ends_with(&header)))
+            .take_while(|line| !line.starts_with("# ----"))
+            .collect()
+    }
+
+    #[test]
+    fn build_args_are_declared_in_the_build_stage_only() {
+        let (_dir, app) = fixture(&[
+            (
+                "package.json",
+                r#"{"scripts":{"build":"vite build","start":"node server.js"}}"#,
+            ),
+            ("package-lock.json", "{}"),
+        ]);
+        let mut env = Environment::new();
+        env.add_build_arg("VITE_API_URL");
+        let analysis = analyze(&app, &env, &autopack_providers::registry()).unwrap();
+        let dockerfile = to_dockerfile(&analysis.plan).unwrap();
+
+        let build = stage(&dockerfile, "autopack-build");
+        let arg = build
+            .iter()
+            .position(|line| *line == "ARG VITE_API_URL")
+            .unwrap_or_else(|| panic!("no ARG in the build stage:\n{dockerfile}"));
+        let first_run = build
+            .iter()
+            .position(|line| line.starts_with("RUN"))
+            .unwrap();
+        assert!(arg < first_run, "{dockerfile}");
+
+        // A changed value must not re-run the dependency install, and the
+        // runtime image never declares it.
+        assert_eq!(
+            dockerfile.matches("ARG VITE_API_URL").count(),
+            1,
+            "{dockerfile}"
+        );
+        assert!(!stage(&dockerfile, "autopack-install").contains(&"ARG VITE_API_URL"));
+    }
+
+    #[test]
+    fn a_step_declares_only_the_plan_build_args_it_lists() {
+        let mut plan = BuildPlan::new();
+        plan.build_args = vec!["PUBLIC_URL".into(), "OTHER".into()];
+        let mut build = Step::new("build");
+        build.add_input(Layer::image("alpine"));
+        build.add_command(Command::shell("./build.sh"));
+        build.build_args = vec!["PUBLIC_URL".into()];
+        plan.add_step(build);
+        plan.deploy = Deploy {
+            base: Layer::step("build"),
+            start_command: Some("./app".into()),
+            ..Default::default()
+        };
+
+        let dockerfile = to_dockerfile(&plan).unwrap();
+        assert!(
+            dockerfile.contains("ARG PUBLIC_URL\n# ./build.sh\nRUN sh -c './build.sh'"),
+            "{dockerfile}"
+        );
+        assert!(!dockerfile.contains("ARG OTHER"), "{dockerfile}");
+
+        // A name the plan does not declare is an error, not a silent no-op.
+        plan.steps[0].build_args.push("UNDECLARED".into());
+        let err = to_dockerfile(&plan).unwrap_err().to_string();
+        assert!(err.contains("build argument `UNDECLARED`"), "{err}");
+    }
+
+    #[test]
+    fn steps_declare_no_build_args_by_default() {
+        let mut plan = BuildPlan::new();
+        plan.build_args = vec!["PUBLIC_URL".into()];
+        let mut install = Step::new("install");
+        install.add_input(Layer::image("alpine"));
+        install.add_command(Command::shell("./install.sh"));
+        plan.add_step(install);
+        plan.deploy = Deploy {
+            base: Layer::step("install"),
+            start_command: Some("./app".into()),
+            ..Default::default()
+        };
+
+        let dockerfile = to_dockerfile(&plan).unwrap();
+        assert!(!dockerfile.contains("ARG "), "{dockerfile}");
     }
 
     #[test]

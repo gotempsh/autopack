@@ -61,6 +61,10 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub secrets: Vec<String>,
 
+    /// Additional build argument names the build should receive.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub build_args: Vec<String>,
+
     /// Additional paths excluded from the build context.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exclude: Vec<String>,
@@ -82,6 +86,10 @@ pub struct StepPatch {
     /// Replaces the step's secret allowlist.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secrets: Option<Vec<String>>,
+
+    /// Replaces the build arguments the step declares.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_args: Option<Vec<String>>,
 
     /// Merged into the step's assets.
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
@@ -225,6 +233,12 @@ impl Config {
             }
         }
 
+        for name in &self.build_args {
+            if !plan.build_args.contains(name) {
+                plan.build_args.push(name.clone());
+            }
+        }
+
         for path in &self.exclude {
             if !plan.exclude.contains(path) {
                 plan.exclude.push(path.clone());
@@ -236,6 +250,7 @@ impl Config {
                 Some(step) => patch.apply(step),
                 None => {
                     let mut step = Step::new(name);
+                    step.grant_default_build_args();
                     patch.apply(&mut step);
                     plan.steps.push(step);
                 }
@@ -260,6 +275,10 @@ impl StepPatch {
 
         if let Some(secrets) = &self.secrets {
             step.secrets = secrets.clone();
+        }
+
+        if let Some(build_args) = &self.build_args {
+            step.build_args = build_args.clone();
         }
 
         if let Some(caches) = &self.caches {
@@ -381,6 +400,29 @@ mod tests {
         assert_eq!(config.packages["node"], "22");
         assert_eq!(config.packages["python"], "3.12");
         assert_eq!(config.packages["go"], "latest");
+    }
+
+    #[test]
+    fn a_build_step_created_by_config_reads_every_build_arg() {
+        let mut config = Config::default();
+        config.apply_environment(&Environment::from_pairs([("AUTOPACK_BUILD_CMD", "make")]));
+        let mut plan = plan_with_build();
+        plan.steps.clear();
+        config.apply(&mut plan);
+        assert_eq!(plan.step("build").unwrap().build_args, vec!["*"]);
+    }
+
+    #[test]
+    fn build_args_can_be_declared_and_moved_between_steps() {
+        let config: Config = serde_json::from_str(
+            r#"{"buildArgs":["PUBLIC_URL"],"steps":{"install":{"buildArgs":["PUBLIC_URL"]},"build":{"buildArgs":[]}}}"#,
+        )
+        .unwrap();
+        let mut plan = plan_with_build();
+        config.apply(&mut plan);
+        assert_eq!(plan.build_args, vec!["PUBLIC_URL"]);
+        assert_eq!(plan.step("install").unwrap().build_args, vec!["PUBLIC_URL"]);
+        assert!(plan.step("build").unwrap().build_args.is_empty());
     }
 
     #[test]

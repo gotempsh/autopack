@@ -107,6 +107,12 @@ struct CommonArgs {
     #[arg(long = "secret", value_name = "NAME")]
     secrets: Vec<String>,
 
+    /// Name of a build argument the build step reads, such as `VITE_API_URL`.
+    /// Its value is read from the environment variable of the same name. For
+    /// values the app is meant to contain; pass credentials with `--secret`.
+    #[arg(long = "build-arg", value_name = "NAME")]
+    build_args: Vec<String>,
+
     /// Extra `KEY=VALUE` build variable, repeatable.
     #[arg(long = "env", value_name = "KEY=VALUE")]
     env: Vec<String>,
@@ -316,6 +322,9 @@ fn analyse(common: &CommonArgs) -> Result<Analysis> {
     for secret in &common.secrets {
         env.add_secret(secret);
     }
+    for name in &common.build_args {
+        env.add_build_arg(name);
+    }
 
     Ok(analyze(&app, &env, &autopack_providers::registry())?)
 }
@@ -455,6 +464,15 @@ fn build(
         args.push(format!("id={secret},env={secret}"));
     }
 
+    let (build_arg_args, warnings) =
+        build_arg_flags(&analysis.plan.build_args, &common.build_args, |name| {
+            std::env::var_os(name).is_some()
+        });
+    for warning in warnings {
+        eprintln!("warning: {warning}");
+    }
+    args.extend(build_arg_args);
+
     args.push(context_path.display().to_string());
 
     if dry_run {
@@ -484,4 +502,92 @@ fn build(
         eprintln!("built {tag}");
     }
     Ok(())
+}
+
+/// The `--build-arg` flags for a build, and a warning for each requested name
+/// that gets no value.
+///
+/// Only names the operator granted with `--build-arg` are forwarded. The plan
+/// also lists names an app's `autopack.json` requests, and forwarding those
+/// from this process's environment would let a repository read any host
+/// variable it can name, such as a cloud credential, in its build commands.
+///
+/// Each flag is the bare name: without `=VALUE`, docker reads the value from
+/// its own environment, so it never appears on the command line or in
+/// `--dry-run` output.
+fn build_arg_flags(
+    requested: &[String],
+    granted: &[String],
+    is_set: impl Fn(&str) -> bool,
+) -> (Vec<String>, Vec<String>) {
+    let mut args = Vec::new();
+    let mut warnings = Vec::new();
+    for name in requested {
+        if !granted.contains(name) {
+            warnings.push(format!(
+                "build argument `{name}` is requested by the app's configuration but was not \
+                 granted, so the build gets no value for it; pass `--build-arg {name}` to \
+                 forward it"
+            ));
+            continue;
+        }
+        if !is_set(name) {
+            warnings.push(format!(
+                "build argument `{name}` was requested but is not set in the environment"
+            ));
+            continue;
+        }
+        args.push("--build-arg".to_string());
+        args.push(name.clone());
+    }
+    (args, warnings)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn names(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[test]
+    fn only_granted_build_args_are_forwarded() {
+        // The app's config asks for a host credential; the operator granted
+        // only the public value.
+        let requested = names(&["VITE_API_URL", "AWS_SECRET_ACCESS_KEY"]);
+        let granted = names(&["VITE_API_URL"]);
+
+        let (args, warnings) = build_arg_flags(&requested, &granted, |_| true);
+
+        assert_eq!(args, names(&["--build-arg", "VITE_API_URL"]));
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0].contains("`AWS_SECRET_ACCESS_KEY` is requested by the app's configuration"),
+            "{warnings:?}"
+        );
+        assert!(warnings[0].contains("--build-arg AWS_SECRET_ACCESS_KEY"));
+    }
+
+    #[test]
+    fn a_granted_build_arg_without_a_value_is_skipped_with_a_warning() {
+        let requested = names(&["VITE_API_URL"]);
+
+        let (args, warnings) = build_arg_flags(&requested, &requested, |_| false);
+
+        assert!(args.is_empty());
+        assert_eq!(
+            warnings,
+            ["build argument `VITE_API_URL` was requested but is not set in the environment"]
+        );
+    }
+
+    #[test]
+    fn build_arg_flags_never_carry_a_value() {
+        let requested = names(&["VITE_API_URL"]);
+
+        let (args, _) = build_arg_flags(&requested, &requested, |_| true);
+
+        assert!(args.iter().all(|arg| !arg.contains('=')), "{args:?}");
+    }
 }

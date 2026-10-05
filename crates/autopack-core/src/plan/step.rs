@@ -28,6 +28,15 @@ pub struct Step {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub secrets: Vec<String>,
 
+    /// Build argument names this step declares as `ARG`s. `["*"]` means all.
+    ///
+    /// Empty unless a step opts in, unlike [`Step::secrets`]: a build
+    /// argument's value is part of the cache key of every `RUN` after it, so
+    /// declaring one in a dependency install would re-run the install whenever
+    /// the value changed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub build_args: Vec<String>,
+
     /// Inline file contents addressed by [`super::FileCommand::name`].
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
     pub assets: IndexMap<String, String>,
@@ -58,6 +67,22 @@ impl Step {
     /// True when this step reads every available secret.
     pub fn uses_all_secrets(&self) -> bool {
         self.secrets.iter().any(|s| s == "*")
+    }
+
+    /// Give the build step every build argument, unless it already says otherwise.
+    ///
+    /// The build step is where a framework reads `VITE_*` or `NEXT_PUBLIC_*`
+    /// and inlines it, and it runs after dependencies are installed, so a
+    /// changed value only re-runs the build. Other steps opt in explicitly.
+    pub(crate) fn grant_default_build_args(&mut self) {
+        if self.name == crate::steps::BUILD && self.build_args.is_empty() {
+            self.build_args = vec!["*".to_string()];
+        }
+    }
+
+    /// True when this step declares every build argument.
+    pub fn uses_all_build_args(&self) -> bool {
+        self.build_args.iter().any(|name| name == "*")
     }
 
     /// Append an input layer.

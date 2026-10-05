@@ -484,6 +484,7 @@ impl<'a> BuildContext<'a> {
                         .insert(0, Layer::image(self.pinned(&self.base_image)));
                 }
             }
+            step.grant_default_build_args();
             plan.add_step(step);
         }
 
@@ -511,6 +512,7 @@ impl<'a> BuildContext<'a> {
         }
 
         plan.secrets = self.env.secrets().to_vec();
+        plan.build_args = self.env.build_args().to_vec();
         plan.exclude = DEFAULT_EXCLUDES.iter().map(|s| s.to_string()).collect();
 
         self.config.apply(&mut plan);
@@ -957,6 +959,27 @@ mod tests {
         let build = plan.step(steps::BUILD).unwrap();
         assert_eq!(build.inputs[0].image.as_deref(), Some(DEFAULT_BASE_IMAGE));
         plan.validate().unwrap();
+    }
+
+    #[test]
+    fn build_args_reach_the_build_step_only() {
+        let dir = app_fixture();
+        let app = App::new(dir.path()).unwrap();
+        let mut env = Environment::new();
+        env.add_build_arg("VITE_API_URL");
+        let config = Config::default();
+
+        let mut ctx = BuildContext::new(&app, &env, &config);
+        ctx.step(steps::BUILD)
+            .add_command(Command::shell("vite build"));
+        ctx.set_start_command("./app");
+        let plan = ctx.generate().unwrap();
+
+        assert_eq!(plan.build_args, vec!["VITE_API_URL"]);
+        assert_eq!(plan.step(steps::BUILD).unwrap().build_args, vec!["*"]);
+        for step in plan.steps.iter().filter(|step| step.name != steps::BUILD) {
+            assert!(step.build_args.is_empty(), "{}", step.name);
+        }
     }
 
     #[test]

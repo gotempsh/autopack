@@ -335,6 +335,7 @@ app root or with `AUTOPACK_*` environment variables. Environment variables win.
     "variables": { "LOG_LEVEL": "info" }
   },
   "secrets": ["DATABASE_URL"],
+  "buildArgs": ["VITE_API_URL"],
   "exclude": ["docs"]
 }
 ```
@@ -362,6 +363,19 @@ app root or with `AUTOPACK_*` environment variables. Environment variables win.
 Secrets are passed by name (`autopack build . --secret DATABASE_URL`), read from
 the environment at build time, mounted with `--mount=type=secret`, and never
 written into the plan or into an image layer.
+
+Build arguments are for values the app is *meant* to contain, such as the
+`VITE_*` or `NEXT_PUBLIC_*` variables a framework inlines into its bundle. They
+are passed by name too (`autopack build . --build-arg VITE_API_URL`) and
+declared as `ARG`s in the build step only, after dependencies are installed, so
+a changed value re-runs the build but not the install. A step's `buildArgs`
+moves or removes them. A build argument a `RUN` reads is recorded in that
+stage's image history, so never pass a credential this way; use a secret.
+
+`buildArgs` in `autopack.json` only *declares* names. The CLI forwards a value
+only for names you grant with `--build-arg`, and warns about any other name the
+configuration requests, so a repository cannot read a host variable just by
+naming it.
 
 ## Tasks
 

@@ -13,10 +13,16 @@ pub const CONFIG_PREFIX: &str = "AUTOPACK_";
 ///   and `AUTOPACK_*` configuration). These end up in the plan.
 /// * **secrets** — names only. Values are supplied to the backend at build time
 ///   and never serialised into a plan, so a plan is safe to log or cache.
+/// * **build args** — names only, like secrets, but declared as `ARG`s the
+///   build step reads as ordinary environment variables. For values a
+///   framework inlines into its output (`VITE_*`, `NEXT_PUBLIC_*`), not for
+///   credentials: a build argument a `RUN` reads is recorded in the build
+///   stage's image history.
 #[derive(Debug, Clone, Default)]
 pub struct Environment {
     variables: IndexMap<String, String>,
     secrets: Vec<String>,
+    build_args: Vec<String>,
 }
 
 impl Environment {
@@ -101,6 +107,20 @@ impl Environment {
     pub fn secrets(&self) -> &[String] {
         &self.secrets
     }
+
+    /// Declare a build argument by name.
+    pub fn add_build_arg(&mut self, name: impl Into<String>) -> &mut Self {
+        let name = name.into();
+        if !self.build_args.contains(&name) {
+            self.build_args.push(name);
+        }
+        self
+    }
+
+    /// Declared build argument names.
+    pub fn build_args(&self) -> &[String] {
+        &self.build_args
+    }
 }
 
 #[cfg(test)]
@@ -126,5 +146,15 @@ mod tests {
             Environment::from_pairs([("AUTOPACK_PROVIDER", "node"), ("NODE_ENV", "production")]);
         let app: Vec<_> = env.app_variables().collect();
         assert_eq!(app, vec![("NODE_ENV", "production")]);
+    }
+
+    #[test]
+    fn build_args_are_declared_once() {
+        let mut env = Environment::new();
+        env.add_build_arg("VITE_API_URL")
+            .add_build_arg("VITE_API_URL");
+        assert_eq!(env.build_args(), ["VITE_API_URL"]);
+        // Declaring a name is not setting a value.
+        assert_eq!(env.get("VITE_API_URL"), None);
     }
 }
