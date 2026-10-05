@@ -381,6 +381,27 @@ impl<'a> BuildContext<'a> {
         self.metadata.insert(key.into(), value.into());
     }
 
+    /// Operator-selected project identity for app-scoped cache reuse.
+    ///
+    /// A checkout path is not an identity: workers can reuse it for different
+    /// projects. Require an explicit stable key when app scoping is requested.
+    /// Cache IDs separate reuse, but are not an access-control boundary.
+    fn cache_scope(&self) -> Result<Option<String>> {
+        match self.env.config("CACHE_SCOPE") {
+            Some("app") => {
+                let key = self.env.config("CACHE_KEY").filter(|key| !key.trim().is_empty())
+                    .ok_or_else(|| Error::InvalidPlan(
+                        "AUTOPACK_CACHE_SCOPE=app requires AUTOPACK_CACHE_KEY: set a stable, unique project identifier".into()
+                    ))?;
+                Ok(Some(key.to_owned()))
+            }
+            None | Some("shared") => Ok(None),
+            Some(_) => Err(Error::InvalidPlan(
+                "AUTOPACK_CACHE_SCOPE must be shared or app".into(),
+            )),
+        }
+    }
+
     /// Record a decision the user should know about, as the next free
     /// `configNoteN` entry, and log it as a warning.
     ///
@@ -438,6 +459,7 @@ impl<'a> BuildContext<'a> {
 
         let mut plan = BuildPlan::new();
         plan.caches = self.caches.clone();
+        plan.cache_scope = self.cache_scope()?;
 
         let needs_packages_step = !self.packages.is_empty() || !self.build_apt_packages.is_empty();
         if needs_packages_step {
@@ -848,6 +870,53 @@ mod tests {
             )
         );
         assert_eq!(shell_quote("package'name"), "'package'\"'\"'name'");
+    }
+
+    #[test]
+    fn generated_plans_scope_caches_only_when_requested() {
+        let first = app_fixture();
+        let second = app_fixture();
+        let first_app = App::new(first.path()).unwrap();
+        let second_app = App::new(second.path()).unwrap();
+        let config = Config::default();
+        let shared = Environment::new();
+        let scoped = Environment::from_pairs([
+            ("AUTOPACK_CACHE_SCOPE", "app"),
+            ("AUTOPACK_CACHE_KEY", "first-project"),
+        ]);
+        let other_scope = Environment::from_pairs([
+            ("AUTOPACK_CACHE_SCOPE", "app"),
+            ("AUTOPACK_CACHE_KEY", "second-project"),
+        ]);
+        let mut shared_ctx = BuildContext::new(&first_app, &shared, &config);
+        shared_ctx.set_start_command("true");
+        assert!(shared_ctx.generate().unwrap().cache_scope.is_none());
+        let mut first_ctx = BuildContext::new(&first_app, &scoped, &config);
+        let mut second_ctx = BuildContext::new(&second_app, &other_scope, &config);
+        first_ctx.set_start_command("true");
+        second_ctx.set_start_command("true");
+        let first_scope = first_ctx.generate().unwrap().cache_scope.unwrap();
+        let second_scope = second_ctx.generate().unwrap().cache_scope.unwrap();
+        assert_ne!(first_scope, second_scope);
+        let mut relocated = BuildContext::new(&second_app, &scoped, &config);
+        relocated.set_start_command("true");
+        assert_eq!(
+            first_scope,
+            relocated.generate().unwrap().cache_scope.unwrap()
+        );
+        for env in [
+            Environment::from_pairs([("AUTOPACK_CACHE_SCOPE", "app")]),
+            Environment::from_pairs([("AUTOPACK_CACHE_SCOPE", "app"), ("AUTOPACK_CACHE_KEY", " ")]),
+            Environment::from_pairs([("AUTOPACK_CACHE_SCOPE", "ap")]),
+        ] {
+            let mut invalid = BuildContext::new(&first_app, &env, &config);
+            invalid.set_start_command("true");
+            assert!(invalid.generate().is_err());
+        }
+        assert_eq!(
+            first_scope,
+            first_ctx.generate().unwrap().cache_scope.unwrap()
+        );
     }
 
     #[test]

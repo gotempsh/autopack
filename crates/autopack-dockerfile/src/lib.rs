@@ -386,17 +386,12 @@ fn mount_flags(plan: &BuildPlan, step: &Step) -> String {
             CacheType::Shared => "shared",
             CacheType::Locked => "locked",
         };
-        // The id is derived from the cache name and its mount point, not from
-        // the app: every project on a builder that caches `/cache/npm` shares
-        // one volume. That is deliberate for a content-addressed package
-        // store, which is built to be shared and is most of the value of
-        // caching at all — but it does mean the mount is not a tenant
-        // boundary, so a build that executes untrusted code is writing to a
-        // store other builds read.
+        // Package stores share IDs by default. An operator-selected scope
+        // separates project cache reuse; it is not an access-control boundary.
         let _ = write!(
             flags,
             " --mount=type=cache,id={id},target={target},sharing={sharing}",
-            id = cache_id(name, cache),
+            id = cache_id(name, cache, plan.cache_scope.as_deref()),
             target = cache.directory,
         );
     }
@@ -430,8 +425,19 @@ fn one_line(value: &str) -> String {
     value.replace(['\n', '\r'], " ").trim_end().to_string()
 }
 
-fn cache_id(name: &str, cache: &Cache) -> String {
-    format!("autopack-{name}-{}", sanitize(&cache.directory))
+fn cache_id(name: &str, cache: &Cache, scope: Option<&str>) -> String {
+    match scope {
+        Some(scope) => format!(
+            "autopack-{}-{name}-{}",
+            scope
+                .as_bytes()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
+            sanitize(&cache.directory)
+        ),
+        None => format!("autopack-{name}-{}", sanitize(&cache.directory)),
+    }
 }
 
 /// A Dockerfile stage name derived from a step name.
@@ -496,6 +502,40 @@ fn json_string(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn cache_ids_are_shared_by_default_and_isolated_on_request() {
+        let cache = Cache::shared("/cache/npm");
+        // Two projects on one worker land on the same volume unless asked.
+        assert_eq!(
+            cache_id("npm-store", &cache, None),
+            "autopack-npm-store-cache-npm"
+        );
+        assert_ne!(
+            cache_id("npm-store", &cache, Some("abc123")),
+            cache_id("npm-store", &cache, Some("def456"))
+        );
+        // The scoped form still separates two caches within one app.
+        assert_ne!(
+            cache_id("npm-store", &cache, Some("abc123")),
+            cache_id("pnpm-store", &cache, Some("abc123"))
+        );
+    }
+
+    #[test]
+    fn cache_scope_cannot_inject_mount_options_or_directives() {
+        let cache = Cache::shared("/cache/npm");
+        let id = cache_id("npm-store", &cache, Some("app,target=/etc\nRUN evil"));
+        assert!(id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
+        assert_ne!(
+            cache_id("npm-store", &cache, Some("App")),
+            cache_id("npm-store", &cache, Some("app"))
+        );
+        assert_ne!(
+            cache_id("npm-store", &cache, Some("a,b")),
+            cache_id("npm-store", &cache, Some("a-b"))
+        );
+    }
 
     #[test]
     fn a_newline_in_a_display_name_cannot_inject_a_directive() {
