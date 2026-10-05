@@ -61,19 +61,10 @@ impl Lock {
     /// A lock that is a symlink leading out of `app_root` counts as absent,
     /// like every other file read from the source tree.
     pub fn load(app_root: &Path) -> Result<Option<Self>> {
-        let Ok(root) = app_root.canonicalize() else {
+        let app = crate::App::new(app_root)?;
+        let Some(contents) = app.read_file_opt(LOCK_FILE)? else {
             return Ok(None);
         };
-        let Some(path) =
-            crate::app::resolve_within(&root, Path::new(LOCK_FILE)).filter(|path| path.is_file())
-        else {
-            return Ok(None);
-        };
-
-        let contents = std::fs::read_to_string(&path).map_err(|source| Error::ReadFile {
-            path: LOCK_FILE.into(),
-            source,
-        })?;
         let lock: Lock = serde_json::from_str(&contents).map_err(|e| Error::ParseFile {
             path: LOCK_FILE.into(),
             message: e.to_string(),
