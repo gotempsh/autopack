@@ -5,6 +5,51 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.4] - 2026-10-05
+
+### Added
+
+- Let an operator scope cache mounts per app
+- **plan:** Declare variables to generate and data that must persist
+- **providers:** Resolve manifest version ranges to the newest published image
+- **node:** Build server frameworks' front ends and support webpack 4 on Node 17+
+- **ruby:** Deploy Rails apps without manual setup
+- **php:** Deploy Laravel and Symfony apps without manual setup
+- **python:** Collect Django static files and flag its SQLite database
+- **elixir:** Deploy Phoenix apps with generated secrets and without releases
+
+### Build
+
+- **deps:** Bump thiserror from 2.0.19 to 2.0.21
+- **deps:** Bump clap from 4.6.5 to 4.6.7
+- **deps:** Bump toml from 1.1.4+spec-1.1.0 to 1.1.6+spec-1.1.0
+- **deps:** Bump indexmap from 2.14.0 to 2.14.2
+- **deps:** Bump globset from 0.4.19 to 0.4.20
+
+### Fixed
+
+- **core:** Do not read files through links out of the source tree ([#35](https://github.com/gotempsh/autopack/issues/35))
+- **node:** Persist pnpm 11 downloads and Next.js compiler cache
+- **node:** Isolate compiler caches and cover workspace apps
+- **node:** Keep workspace cache identities stable
+- **compat:** Keep generated commands for a nixpacks "..." phase entry
+- **apt:** Install packages on end-of-life Debian images and across releases
+- **providers:** Separate migrations and honor database configuration
+- **providers:** Cover release overrides and persistence edge cases
+- **ruby:** Persist configured Disk storage roots
+- **ruby:** Parse storage roots conservatively
+- **core:** Confine source reads to retained directory handles
+- **core:** Acquire roots without following replacement links
+- **core:** Anchor acquisition and preserve file indexing limits
+- **core:** Bound directory traversal independently of indexed files
+- **cache:** Require stable project keys for app scoping
+- **static:** Copy Caddy without its file capability
+- **static:** Avoid configured Caddy step collisions
+
+### Testing
+
+- **cache:** Verify app scope in generated plans
+
 ## [0.1.3] - 2026-08-15
 
 ### Fixed
