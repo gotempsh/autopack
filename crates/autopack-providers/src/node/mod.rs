@@ -765,15 +765,18 @@ fn dependency_major(package: &PackageJson, name: &str) -> Option<u64> {
 ///
 /// Anything the parser does not fully account for is `None`: an `output` it
 /// could not read (shorthand, quoted key, `config.output`, a spread), or a
-/// config without its own `output` that pulls in another local file
-/// (`webpack-merge` over a common config), whose output is not visible here.
+/// config that pulls in another local file (`webpack-merge` over a common
+/// config) without naming `output.path` itself. `merge()` combines `output`
+/// deeply, so the common config's `path` survives an `output` block here
+/// that only sets `filename`.
 fn configured_output_path(config: &str, config_dir: &str) -> Option<String> {
     let normalised = normalise_config(config);
     let values = object_values(&normalised, "output");
     if values.len() != mentions(&normalised, "output") {
         return None;
     }
-    if values.is_empty() && imports_local_config(&normalised) {
+    let inherits_config = imports_local_config(&normalised);
+    if values.is_empty() && inherits_config {
         return None;
     }
     let mut directories = Vec::new();
@@ -784,6 +787,7 @@ fn configured_output_path(config: &str, config_dir: &str) -> Option<String> {
         };
         let directory = match top_level_value(body, "path") {
             Some(path) => resolved_directory(path, config_dir)?,
+            None if inherits_config => return None,
             None => WEBPACK_DEFAULT_OUTPUT.to_string(),
         };
         directories.push(directory);
@@ -1734,6 +1738,7 @@ module.exports = {
             "module.exports = { output: { ...base.output } }",
             "const common = require('./webpack.common');\nmodule.exports = merge(common, { mode: 'production' });",
             "import common from './webpack.common.js';\nexport default { ...common, mode: 'production' };",
+            "const common = require('./webpack.common');\nmodule.exports = merge(common, { mode: 'production', output: { filename: '[name].[contenthash].js' } });",
             "module.exports = { output: { path: '/var/www' } }",
             "module.exports = { output: { path: path.resolve(__dirname, '../shared') } }",
             "module.exports = { output: { path: path.resolve('/srv', 'dist') } }",
