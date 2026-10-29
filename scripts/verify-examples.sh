@@ -21,6 +21,7 @@ CONTAINER="autopack-verify"
 ALL_EXAMPLES=(
   "node-express:3000"
   "vite-spa:3000"
+  "webpack-spa:3000"
   "bun-server:3000"
   "deno-api:3000"
   "python-flask:8000"

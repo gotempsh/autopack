@@ -15,6 +15,7 @@ bundler run".
 |---|---|---|---|
 | `node-express` | `node` | 3000 | plain Node HTTP server, no dependencies |
 | `vite-spa` | `node` | 3000 | Vite build served by Caddy, SPA fallback |
+| `webpack-spa` | `node` | 3000 | webpack 5 build to the configured `output.path`, served by Caddy |
 | `bun-server` | `node` | 3000 | Bun runtime via the `packageManager` pin |
 | `deno-api` | `deno` | 3000 | `deno task start` |
 | `python-flask` | `python` | 8000 | pip + venv, gunicorn added automatically |

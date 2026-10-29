@@ -44,6 +44,7 @@ const ENTRY_POINTS: &[&str] = &[
     "index.mjs",
     "app.js",
     "src/index.js",
+    "src/index.mjs",
     "dist/index.js",
     "build/index.js",
 ];
@@ -63,6 +64,7 @@ enum Framework {
     Vite,
     CreateReactApp,
     Angular,
+    Webpack,
     None,
 }
 
@@ -78,6 +80,7 @@ impl Framework {
             Self::Vite => "vite",
             Self::CreateReactApp => "create-react-app",
             Self::Angular => "angular",
+            Self::Webpack => "webpack",
             Self::None => "none",
         }
     }
@@ -170,7 +173,7 @@ impl Provider for NodeProvider {
         self.plan_install(ctx, &package, manager, &browsers)?;
         self.plan_build(ctx, &package, manager, framework, &browsers)?;
 
-        let static_site = static_site(ctx, &package, framework);
+        let static_site = static_site(ctx, &package, framework)?;
         // Deferred until the deploy path is known: a static site serves with
         // Caddy and drops /mise, so it has no pnpm binary to load the library
         // for. Deciding this up front shipped it into every Vite bundle.
@@ -507,6 +510,8 @@ fn detect_framework(package: &PackageJson) -> Framework {
         Framework::CreateReactApp
     } else if package.has_dependency("vite") {
         Framework::Vite
+    } else if package.has_dependency("webpack") {
+        Framework::Webpack
     } else {
         Framework::None
     }
@@ -521,18 +526,18 @@ fn static_site(
     ctx: &BuildContext<'_>,
     package: &PackageJson,
     framework: Framework,
-) -> Option<StaticSite> {
+) -> Result<Option<StaticSite>> {
     if let Some(directory) = ctx.env.config("STATIC_DIR") {
-        return Some(StaticSite {
+        return Ok(Some(StaticSite {
             directory: directory.to_string(),
             spa: !ctx.env.is_enabled("AUTOPACK_STATIC_MPA"),
-        });
+        }));
     }
 
     // A start script means the author intends to run a server.
     let has_server_script = package.script("start").is_some();
 
-    match framework {
+    let site = match framework {
         Framework::CreateReactApp if !has_server_script => Some(StaticSite {
             directory: "build".into(),
             spa: true,
@@ -556,8 +561,253 @@ fn static_site(
                 spa: false,
             })
         }
+        // An unreadable output path falls through to a server deploy, whose
+        // missing start command names `AUTOPACK_STATIC_DIR` as the fix.
+        Framework::Webpack if !has_server_script && is_webpack_spa(package) => {
+            webpack_output_directory(ctx.app, package)?.map(|directory| StaticSite {
+                directory,
+                spa: true,
+            })
+        }
         _ => None,
+    };
+    Ok(site)
+}
+
+/// Whether a webpack app bundles a browser page rather than a server.
+///
+/// webpack builds servers and libraries as readily as SPAs, so its presence
+/// says nothing about the output. `html-webpack-plugin` does: it is what
+/// emits the `index.html` a static server needs. The build script has to run
+/// webpack too, or the configured output is never produced.
+fn is_webpack_spa(package: &PackageJson) -> bool {
+    package.has_dependency("html-webpack-plugin")
+        && package.script("build").is_some_and(|script| {
+            script
+                .split_whitespace()
+                .any(|word| matches!(word, "webpack" | "webpack-cli"))
+        })
+}
+
+/// Config files webpack-cli loads when no `--config` is given, in its order.
+const WEBPACK_CONFIGS: &[&str] = &[
+    "webpack.config.js",
+    "webpack.config.mjs",
+    "webpack.config.cjs",
+    "webpack.config.ts",
+    "webpack.config.mts",
+    "webpack.config.cts",
+];
+
+/// Where a webpack build writes its output, relative to the app root.
+///
+/// `None` when it cannot be told without running the config: guessing would
+/// serve an empty directory, which is a worse failure than asking for
+/// `AUTOPACK_STATIC_DIR`.
+fn webpack_output_directory(app: &App, package: &PackageJson) -> Result<Option<String>> {
+    let script = package.script("build").unwrap_or_default();
+    let flags = WebpackFlags::parse(script);
+    if let Some(directory) = flags.output_path {
+        return Ok(relative_directory(&directory));
     }
+
+    let config = match flags.config {
+        Some(config) => match app.read_file_opt(&config)? {
+            Some(contents) => contents,
+            None => return Ok(None),
+        },
+        None => {
+            let mut found = None;
+            for name in WEBPACK_CONFIGS {
+                if let Some(contents) = app.read_file_opt(name)? {
+                    found = Some(contents);
+                    break;
+                }
+            }
+            match found {
+                Some(contents) => contents,
+                // Zero-config webpack writes to `dist`.
+                None => return Ok(Some(WEBPACK_DEFAULT_OUTPUT.to_string())),
+            }
+        }
+    };
+    Ok(configured_output_path(&config))
+}
+
+/// webpack's `output.path` when the config does not set one.
+const WEBPACK_DEFAULT_OUTPUT: &str = "dist";
+
+/// The webpack-cli flags that change which config is read or where it writes.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct WebpackFlags {
+    config: Option<String>,
+    output_path: Option<String>,
+}
+
+impl WebpackFlags {
+    fn parse(script: &str) -> Self {
+        let mut flags = Self::default();
+        let mut words = script.split_whitespace();
+        while let Some(word) = words.next() {
+            let (name, inline) = match word.split_once('=') {
+                Some((name, value)) => (name, Some(value.to_string())),
+                None => (word, None),
+            };
+            let target = match name {
+                "--config" | "-c" => &mut flags.config,
+                "--output-path" | "-o" => &mut flags.output_path,
+                _ => continue,
+            };
+            let value = inline.or_else(|| words.next().map(str::to_string));
+            *target = value.map(|v| v.trim_matches(|c| c == '\'' || c == '"').to_string());
+        }
+        flags
+    }
+}
+
+/// The directory a webpack config's `output.path` names.
+///
+/// Read as text rather than evaluated, like `next.config.*`. Recognises the
+/// forms configs are written in practice — `path.resolve(__dirname, 'build')`,
+/// `path.join(...)`, a bare `resolve(...)` — and a config with no
+/// `output.path` at all, which writes to `dist`. Several configs (an exported
+/// array) must agree. Anything else is `None`.
+///
+/// Whole-line `//` comments are dropped so a commented-out `output` block is
+/// not read as live config. Block comments are left alone: stripping them
+/// textually would also cut through globs such as `'src/**/*.js'`.
+fn configured_output_path(config: &str) -> Option<String> {
+    let normalised: String = config
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .flat_map(str::chars)
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    let mut directories = Vec::new();
+    for body in object_values(&normalised, "output") {
+        let directory = match body {
+            ObjectValue::Literal(body) => match top_level_value(body, "path") {
+                Some(value) => resolved_directory(value)?,
+                None => WEBPACK_DEFAULT_OUTPUT.to_string(),
+            },
+            // `output: sharedOutput` — defined elsewhere.
+            ObjectValue::Expression => return None,
+        };
+        directories.push(directory);
+    }
+    match directories.split_first() {
+        None => Some(WEBPACK_DEFAULT_OUTPUT.to_string()),
+        Some((first, rest)) if rest.iter().all(|other| other == first) => Some(first.clone()),
+        Some(_) => None,
+    }
+}
+
+/// The value of a `key:` property, wherever it appears in `source`.
+enum ObjectValue<'a> {
+    /// An object literal; the text between its braces.
+    Literal(&'a str),
+    /// Anything that is not an object literal.
+    Expression,
+}
+
+/// Every value assigned to property `key` in whitespace-free `source`.
+fn object_values<'a>(source: &'a str, key: &str) -> Vec<ObjectValue<'a>> {
+    let pattern = format!("{key}:");
+    let mut values = Vec::new();
+    let mut from = 0;
+    while let Some(offset) = source[from..].find(&pattern) {
+        let start = from + offset;
+        from = start + pattern.len();
+        // A property name, not the tail of a longer one (`libraryOutput:`).
+        let preceded_by_boundary = source[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| matches!(c, '{' | ','));
+        if !preceded_by_boundary {
+            continue;
+        }
+        let rest = &source[from..];
+        values.push(match rest.strip_prefix('{').and_then(balanced_body) {
+            Some(body) => ObjectValue::Literal(body),
+            None => ObjectValue::Expression,
+        });
+    }
+    values
+}
+
+/// The text up to the brace that closes one already opened.
+fn balanced_body(source: &str) -> Option<&str> {
+    let mut depth = 0usize;
+    for (index, c) in source.char_indices() {
+        match c {
+            '{' | '(' | '[' => depth += 1,
+            '}' | ')' | ']' if depth == 0 => return (c == '}').then(|| &source[..index]),
+            '}' | ')' | ']' => depth -= 1,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The value of `key:` among the top-level properties of an object body.
+fn top_level_value<'a>(body: &'a str, key: &str) -> Option<&'a str> {
+    let mut depth = 0usize;
+    let mut property_start = 0;
+    let mut properties = Vec::new();
+    for (index, c) in body.char_indices() {
+        match c {
+            '{' | '(' | '[' => depth += 1,
+            '}' | ')' | ']' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                properties.push(&body[property_start..index]);
+                property_start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    properties.push(&body[property_start..]);
+    properties
+        .into_iter()
+        .find_map(|property| property.strip_prefix(key)?.strip_prefix(':'))
+}
+
+/// The app-relative directory a `path.resolve(__dirname, ...)` call names.
+fn resolved_directory(value: &str) -> Option<String> {
+    let call = value.strip_prefix("path.").unwrap_or(value);
+    let arguments = call
+        .strip_prefix("resolve(")
+        .or_else(|| call.strip_prefix("join("))?
+        .strip_suffix(')')?;
+    let mut arguments = arguments.split(',');
+    // Every base that means "the directory the build runs in".
+    if !matches!(
+        arguments.next()?,
+        "__dirname" | "process.cwd()" | "import.meta.dirname"
+    ) {
+        return None;
+    }
+    let segments: Option<Vec<&str>> = arguments.map(string_literal).collect();
+    relative_directory(&segments?.join("/"))
+}
+
+/// The contents of a quoted string with nothing interpolated into it.
+fn string_literal(value: &str) -> Option<&str> {
+    let quote = value.chars().next()?;
+    if !matches!(quote, '\'' | '"' | '`') {
+        return None;
+    }
+    let inner = value.strip_prefix(quote)?.strip_suffix(quote)?;
+    (!inner.contains(quote) && !inner.contains("${")).then_some(inner)
+}
+
+/// `directory` as a path inside the app, or `None` if it leaves it.
+fn relative_directory(directory: &str) -> Option<String> {
+    let segments: Vec<&str> = directory
+        .split('/')
+        .filter(|segment| !segment.is_empty() && *segment != ".")
+        .collect();
+    let escapes = directory.starts_with('/') || segments.contains(&"..");
+    (!segments.is_empty() && !escapes).then(|| segments.join("/"))
 }
 
 /// What a non-Node provider learns from [`plan_front_end`].
@@ -810,8 +1060,11 @@ fn is_simple_command(script: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{needs_legacy_openssl, PackageJson, PLAYWRIGHT_BROWSERS, RUNTIME_DEPS_FILE};
-    use crate::test_support::{plan_for, plan_with_env, write_app};
+    use super::{
+        configured_output_path, needs_legacy_openssl, PackageJson, WebpackFlags,
+        PLAYWRIGHT_BROWSERS, RUNTIME_DEPS_FILE,
+    };
+    use crate::test_support::{plan_for, plan_with_env, try_plan_for, write_app};
     use autopack_core::APP_DIR;
 
     #[test]
@@ -923,6 +1176,248 @@ mod tests {
         assert_eq!(
             analysis.plan.deploy.start_command.as_deref(),
             Some("npm run start")
+        );
+    }
+
+    /// A React app bundled by webpack 5 with `html-webpack-plugin`, the shape
+    /// of a Module Federation host or remote.
+    const WEBPACK_SPA_PACKAGE: &str = r#"{
+        "scripts": {"dev": "webpack serve --mode development", "build": "webpack --mode production"},
+        "dependencies": {"react": "^18.3.1", "react-dom": "^18.3.1"},
+        "devDependencies": {"html-webpack-plugin": "^5.6.0", "webpack": "^5.94.0", "webpack-cli": "^5.1.4"}
+    }"#;
+
+    #[test]
+    fn webpack_spas_are_served_as_static_sites_from_dist() {
+        let (_dir, app) = write_app(&[
+            ("package.json", WEBPACK_SPA_PACKAGE),
+            ("package-lock.json", "{}"),
+            (
+                "webpack.config.js",
+                r#"const HtmlWebpackPlugin = require('html-webpack-plugin');
+const { ModuleFederationPlugin } = require('webpack').container;
+module.exports = {
+  entry: './src/index',
+  output: { publicPath: 'auto', clean: true },
+  devServer: { port: 3000, historyApiFallback: true },
+  plugins: [
+    new ModuleFederationPlugin({ name: 'host', remotes: { shop: 'shop@http://localhost:3001/remoteEntry.js' } }),
+    new HtmlWebpackPlugin({ template: './src/index.html' }),
+  ],
+};"#,
+            ),
+            ("src/index.html", r#"<div id="root"></div>"#),
+        ]);
+        let analysis = plan_for(&app);
+
+        assert_eq!(analysis.metadata["framework"], "webpack");
+        assert_eq!(analysis.metadata["serve"], "caddy static (dist)");
+        assert!(analysis
+            .plan
+            .deploy
+            .start_command
+            .as_deref()
+            .unwrap()
+            .starts_with("caddy run"));
+        assert_eq!(
+            analysis.plan.step("build").unwrap().commands[0].display_name(),
+            "npm run build"
+        );
+    }
+
+    #[test]
+    fn webpack_spas_without_a_config_use_webpacks_default_output() {
+        let (_dir, app) = write_app(&[("package.json", WEBPACK_SPA_PACKAGE)]);
+        assert_eq!(plan_for(&app).metadata["serve"], "caddy static (dist)");
+    }
+
+    #[test]
+    fn webpack_spas_serve_the_configured_output_path() {
+        let (_dir, app) = write_app(&[
+            ("package.json", WEBPACK_SPA_PACKAGE),
+            (
+                "webpack.config.js",
+                "const path = require('path');\nmodule.exports = {\n  output: {\n    filename: '[name].[contenthash].js',\n    path: path.resolve(__dirname, 'build'),\n  },\n};",
+            ),
+        ]);
+        assert_eq!(plan_for(&app).metadata["serve"], "caddy static (build)");
+    }
+
+    #[test]
+    fn webpack_output_path_flags_override_the_config() {
+        let (_dir, app) = write_app(&[(
+            "package.json",
+            r#"{"scripts":{"build":"webpack --mode production --output-path public/bundle"},
+                "devDependencies":{"html-webpack-plugin":"5","webpack":"5"}}"#,
+        )]);
+        assert_eq!(
+            plan_for(&app).metadata["serve"],
+            "caddy static (public/bundle)"
+        );
+    }
+
+    #[test]
+    fn webpack_without_an_html_page_runs_a_server() {
+        // webpack bundling a Node server: no html-webpack-plugin, a start script.
+        let (_dir, app) = write_app(&[(
+            "package.json",
+            r#"{"scripts":{"build":"webpack","start":"node dist/main.js"},
+                "devDependencies":{"webpack":"5","webpack-cli":"5"}}"#,
+        )]);
+        let analysis = plan_for(&app);
+        assert_eq!(analysis.metadata["framework"], "webpack");
+        assert_eq!(
+            analysis.plan.deploy.start_command.as_deref(),
+            Some("node dist/main.js")
+        );
+    }
+
+    #[test]
+    fn webpack_spas_with_a_start_script_run_it() {
+        let (_dir, app) = write_app(&[(
+            "package.json",
+            r#"{"scripts":{"build":"webpack","start":"node server.js"},
+                "devDependencies":{"html-webpack-plugin":"5","webpack":"5"}}"#,
+        )]);
+        assert_eq!(
+            plan_for(&app).plan.deploy.start_command.as_deref(),
+            Some("node server.js")
+        );
+    }
+
+    #[test]
+    fn an_unreadable_webpack_output_path_points_at_static_dir() {
+        let (_dir, app) = write_app(&[
+            ("package.json", WEBPACK_SPA_PACKAGE),
+            (
+                "webpack.config.js",
+                "module.exports = { output: { path: outputDirectory() } };",
+            ),
+        ]);
+        let error = try_plan_for(&app).unwrap_err();
+        assert!(matches!(error, autopack_core::Error::MissingStartCommand));
+        assert!(error.to_string().contains("AUTOPACK_STATIC_DIR"), "{error}");
+
+        let analysis = plan_with_env(&app, &[("AUTOPACK_STATIC_DIR", "out")]).unwrap();
+        assert_eq!(analysis.metadata["serve"], "caddy static (out)");
+    }
+
+    #[test]
+    fn webpack_output_paths_are_read_from_common_config_forms() {
+        let read = |config: &str| configured_output_path(config);
+
+        assert_eq!(read("module.exports = {}").as_deref(), Some("dist"));
+        assert_eq!(
+            read("export default { output: { path: path.join(__dirname, 'www') } }").as_deref(),
+            Some("www")
+        );
+        assert_eq!(
+            read("module.exports = { output: { path: resolve(process.cwd(), \"out\", \"web\") } }")
+                .as_deref(),
+            Some("out/web")
+        );
+        assert_eq!(
+            read(
+                "export default { output: { path: path.resolve(import.meta.dirname, './dist/') } }"
+            )
+            .as_deref(),
+            Some("dist")
+        );
+        // Nested `path` keys belong to other options, not to output.path.
+        assert_eq!(
+            read("module.exports = { output: { library: { path: 'x' }, clean: true } }").as_deref(),
+            Some("dist")
+        );
+        // A commented-out block is not config.
+        assert_eq!(
+            read("module.exports = {\n  // output: { path: path.resolve(__dirname, 'old') },\n  entry: './src',\n}")
+                .as_deref(),
+            Some("dist")
+        );
+        // `libraryOutput:` is not `output:`.
+        assert_eq!(
+            read("module.exports = { experiments: { libraryOutput: { path: 'x' } } }").as_deref(),
+            Some("dist")
+        );
+        // Configs exported as an array must agree.
+        assert_eq!(
+            read("module.exports = [{ output: { path: path.resolve(__dirname, 'a') } }, { output: {} }]"),
+            None
+        );
+        assert_eq!(
+            read("module.exports = [{ output: { clean: true } }, { output: {} }]").as_deref(),
+            Some("dist")
+        );
+    }
+
+    #[test]
+    fn webpack_output_paths_that_cannot_be_read_safely_are_rejected() {
+        for config in [
+            "module.exports = { output: sharedOutput }",
+            "module.exports = { output: { path: '/var/www' } }",
+            "module.exports = { output: { path: path.resolve(__dirname, '../shared') } }",
+            "module.exports = { output: { path: path.resolve('/srv', 'dist') } }",
+            "module.exports = { output: { path: path.resolve(__dirname, `${target}`) } }",
+            "module.exports = { output: { path: path.resolve(__dirname, outDir) } }",
+        ] {
+            assert_eq!(configured_output_path(config), None, "{config}");
+        }
+    }
+
+    #[test]
+    fn webpack_cli_flags_are_parsed_in_both_spellings() {
+        assert_eq!(
+            WebpackFlags::parse("webpack --config=config/prod.js -o build"),
+            WebpackFlags {
+                config: Some("config/prod.js".into()),
+                output_path: Some("build".into()),
+            }
+        );
+        assert_eq!(
+            WebpackFlags::parse("webpack -c 'webpack.prod.js' --output-path=\"out\""),
+            WebpackFlags {
+                config: Some("webpack.prod.js".into()),
+                output_path: Some("out".into()),
+            }
+        );
+        assert_eq!(
+            WebpackFlags::parse("webpack --mode production"),
+            WebpackFlags::default()
+        );
+    }
+
+    #[test]
+    fn a_named_webpack_config_is_the_one_read() {
+        let (_dir, app) = write_app(&[
+            (
+                "package.json",
+                r#"{"scripts":{"build":"webpack --config webpack.prod.js"},
+                    "devDependencies":{"html-webpack-plugin":"5","webpack":"5"}}"#,
+            ),
+            (
+                "webpack.config.js",
+                "module.exports = { output: { path: require('path').resolve(__dirname, 'dev') } };",
+            ),
+            (
+                "webpack.prod.js",
+                "const path = require('path');\nmodule.exports = { output: { path: path.resolve(__dirname, 'release') } };",
+            ),
+        ]);
+        assert_eq!(plan_for(&app).metadata["serve"], "caddy static (release)");
+    }
+
+    #[test]
+    fn an_esm_entry_point_under_src_is_started_directly() {
+        let (_dir, app) = write_app(&[
+            (
+                "package.json",
+                r#"{"type":"module","scripts":{"dev":"node --watch src/index.mjs"},"dependencies":{"express":"^4.19.2"}}"#,
+            ),
+            ("src/index.mjs", "import express from 'express';"),
+        ]);
+        assert_eq!(
+            plan_for(&app).plan.deploy.start_command.as_deref(),
+            Some("node src/index.mjs")
         );
     }
 

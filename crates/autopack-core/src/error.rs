@@ -75,7 +75,9 @@ pub enum Error {
     #[error(
         "could not work out how to start this app.\n\
          Set a start command with `AUTOPACK_START_CMD=...`, a `web:` line in a \
-         Procfile, or {{\"deploy\": {{\"startCommand\": \"...\"}}}} in autopack.json"
+         Procfile, or {{\"deploy\": {{\"startCommand\": \"...\"}}}} in autopack.json.\n\
+         If the build produces static files instead, serve them with \
+         `AUTOPACK_STATIC_DIR=<output directory>`"
     )]
     MissingStartCommand,
 
