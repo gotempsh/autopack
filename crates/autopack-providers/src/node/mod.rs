@@ -869,6 +869,7 @@ fn structural_chars(source: &str) -> impl Iterator<Item = (usize, char)> + '_ {
     })
 }
 
+/// Whether `c` can continue a JavaScript identifier.
 fn is_identifier_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_' || c == '$'
 }
@@ -1411,12 +1412,14 @@ mod tests {
         )
     }
 
+    /// What a planned app serves, or `None` when planning fails.
     fn serves(files: &[(&str, &str)]) -> Option<String> {
         let (_dir, app) = write_app(files);
         let analysis = try_plan_for(&app).ok()?;
         analysis.metadata.get("serve").cloned()
     }
 
+    /// A Module Federation-style config with no `output.path` writes `dist`.
     #[test]
     fn webpack_spas_are_served_as_static_sites_from_dist() {
         let (_dir, app) = write_app(&[
@@ -1457,6 +1460,7 @@ module.exports = {
         );
     }
 
+    /// `output.path` set with `path.resolve(__dirname, ...)` is served.
     #[test]
     fn webpack_spas_serve_the_configured_output_path() {
         assert_eq!(
@@ -1472,6 +1476,7 @@ module.exports = {
         );
     }
 
+    /// Planning stops rather than starting the browser entry under Node.
     #[test]
     fn a_webpack_spa_whose_output_cannot_be_read_fails_planning() {
         for config in [
@@ -1506,6 +1511,7 @@ module.exports = {
         }
     }
 
+    /// A server entry point wins over a webpack client bundle.
     #[test]
     fn a_server_that_builds_its_client_with_webpack_stays_a_server() {
         let config = (
@@ -1538,6 +1544,7 @@ module.exports = {
         );
     }
 
+    /// Without `html-webpack-plugin` there is no page to serve.
     #[test]
     fn webpack_without_an_html_page_runs_a_server() {
         // webpack bundling a Node server: no html-webpack-plugin, a start script.
@@ -1554,6 +1561,7 @@ module.exports = {
         );
     }
 
+    /// A start script says the author runs a server.
     #[test]
     fn webpack_spas_with_a_start_script_run_it() {
         let (_dir, app) = write_app(&[(
@@ -1567,6 +1575,7 @@ module.exports = {
         );
     }
 
+    /// `--output-path` and webpack 5's `-o` decide the directory.
     #[test]
     fn webpack_cli_output_flags_override_the_config() {
         let config = ("webpack.config.js", "module.exports = {};");
@@ -1591,6 +1600,7 @@ module.exports = {
         assert_eq!(serves(&[("package.json", webpack_4), config]), None);
     }
 
+    /// Flags of other tools in the build script are not webpack's.
     #[test]
     fn only_the_webpack_command_s_own_flags_are_read() {
         let files = |build: String| {
@@ -1631,6 +1641,7 @@ module.exports = {
         assert_eq!(serves(&files), None);
     }
 
+    /// `__dirname` is the config file's directory, not the app root.
     #[test]
     fn a_named_config_resolves_dirname_against_its_own_directory() {
         let package = webpack_package("webpack --config config/webpack.prod.js");
@@ -1658,6 +1669,7 @@ module.exports = {
         );
     }
 
+    /// The config forms the parser reads, with the directory each names.
     #[test]
     fn webpack_output_paths_are_read_from_common_config_forms() {
         let read = |config: &str| configured_output_path(config, "");
@@ -1728,6 +1740,7 @@ module.exports = {
         );
     }
 
+    /// Forms whose directory cannot be told without running the config.
     #[test]
     fn webpack_output_paths_that_cannot_be_read_safely_are_rejected() {
         for config in [
@@ -1750,6 +1763,7 @@ module.exports = {
         }
     }
 
+    /// `--flag value` and `--flag=value`, and the unreadable cases.
     #[test]
     fn webpack_cli_flags_are_parsed_in_both_spellings() {
         let parse = |words: &str| {
@@ -1781,6 +1795,7 @@ module.exports = {
         assert_eq!(parse("--output dist/bundle.js"), None);
     }
 
+    /// An ESM service whose only script is `dev` still gets a start command.
     #[test]
     fn an_esm_entry_point_under_src_is_started_directly() {
         let (_dir, app) = write_app(&[
