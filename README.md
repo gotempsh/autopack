@@ -213,7 +213,7 @@ Nothing is written into your repository: the generated Dockerfile and its
 
 | Provider | Detected by | Handles |
 |---|---|---|
-| `node` | `package.json` | npm, pnpm, yarn (classic + berry), bun; Next (incl. `output: 'standalone'`), Nuxt, Remix, SvelteKit, Nest, Astro; Vite/CRA/Astro static builds served by Caddy |
+| `node` | `package.json` | npm, pnpm, yarn (classic + berry), bun; Next (incl. `output: 'standalone'`), Nuxt, Remix, SvelteKit, Nest, Astro; Vite/CRA/Astro and webpack (`html-webpack-plugin`, `output.path` read from the config) static builds served by Caddy |
 | `deno` | `deno.json`, `deno.lock`, `main.ts` | `deno install`, `deno task build`/`start` |
 | `python` | `requirements.txt`, `pyproject.toml`, `Pipfile`, `*.py` | uv, Poetry, Pipenv, pip; Django, FastAPI, Flask entry points |
 | `ruby` | `Gemfile`, `config.ru`, `*.rb` | bundler, Rails (asset precompile), Rack |
@@ -517,7 +517,8 @@ refuses rather than inventing:
 ```
 error: could not work out how to start this app.
 Set a start command with `AUTOPACK_START_CMD=...`, a `web:` line in a Procfile,
-or {"deploy": {"startCommand": "..."}} in autopack.json
+or {"deploy": {"startCommand": "..."}} in autopack.json.
+If the build produces static files instead, serve them with `AUTOPACK_STATIC_DIR=<output directory>`
 ```
 
 The same applies to Go repositories with several `cmd/` binaries, Cargo

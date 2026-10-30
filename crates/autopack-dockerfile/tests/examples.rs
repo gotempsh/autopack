@@ -14,6 +14,7 @@ use autopack_dockerfile::{to_dockerfile, to_dockerignore};
 const EXAMPLES: &[(&str, &str, &str)] = &[
     ("node-express", "node", "node server.js"),
     ("vite-spa", "node", "caddy run"),
+    ("webpack-spa", "node", "caddy run"),
     ("bun-server", "node", "bun run server.ts"),
     ("deno-api", "deno", "deno task start"),
     ("python-flask", "python", "gunicorn app:app"),

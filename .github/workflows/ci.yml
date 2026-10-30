@@ -69,6 +69,7 @@ jobs:
           - { example: node-express }
           - { example: playwright-app }
           - { example: vite-spa }
+          - { example: webpack-spa }
           - { example: bun-server }
           - { example: deno-api }
           - { example: python-flask }

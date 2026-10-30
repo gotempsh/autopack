@@ -34,6 +34,7 @@ SPECS=(
   "node-express:3000:"
   "playwright-app:3000:"
   "vite-spa:3000:mise,node,npm"
+  "webpack-spa:3000:mise,node,npm"
   "bun-server:3000:"
   "deno-api:3000:"
   "python-flask:8000:"

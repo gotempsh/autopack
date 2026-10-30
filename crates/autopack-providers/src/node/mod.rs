@@ -44,6 +44,7 @@ const ENTRY_POINTS: &[&str] = &[
     "index.mjs",
     "app.js",
     "src/index.js",
+    "src/index.mjs",
     "dist/index.js",
     "build/index.js",
 ];
@@ -63,6 +64,7 @@ enum Framework {
     Vite,
     CreateReactApp,
     Angular,
+    Webpack,
     None,
 }
 
@@ -78,6 +80,7 @@ impl Framework {
             Self::Vite => "vite",
             Self::CreateReactApp => "create-react-app",
             Self::Angular => "angular",
+            Self::Webpack => "webpack",
             Self::None => "none",
         }
     }
@@ -170,7 +173,7 @@ impl Provider for NodeProvider {
         self.plan_install(ctx, &package, manager, &browsers)?;
         self.plan_build(ctx, &package, manager, framework, &browsers)?;
 
-        let static_site = static_site(ctx, &package, framework);
+        let static_site = static_site(ctx, &package, framework)?;
         // Deferred until the deploy path is known: a static site serves with
         // Caddy and drops /mise, so it has no pnpm binary to load the library
         // for. Deciding this up front shipped it into every Vite bundle.
@@ -507,6 +510,8 @@ fn detect_framework(package: &PackageJson) -> Framework {
         Framework::CreateReactApp
     } else if package.has_dependency("vite") {
         Framework::Vite
+    } else if package.has_dependency("webpack") {
+        Framework::Webpack
     } else {
         Framework::None
     }
@@ -521,18 +526,18 @@ fn static_site(
     ctx: &BuildContext<'_>,
     package: &PackageJson,
     framework: Framework,
-) -> Option<StaticSite> {
+) -> Result<Option<StaticSite>> {
     if let Some(directory) = ctx.env.config("STATIC_DIR") {
-        return Some(StaticSite {
+        return Ok(Some(StaticSite {
             directory: directory.to_string(),
             spa: !ctx.env.is_enabled("AUTOPACK_STATIC_MPA"),
-        });
+        }));
     }
 
     // A start script means the author intends to run a server.
     let has_server_script = package.script("start").is_some();
 
-    match framework {
+    let site = match framework {
         Framework::CreateReactApp if !has_server_script => Some(StaticSite {
             directory: "build".into(),
             spa: true,
@@ -556,8 +561,470 @@ fn static_site(
                 spa: false,
             })
         }
+        // A webpack page bundle with no sign of a server. An unreadable output
+        // directory stops planning here: falling through to the server path
+        // would run its browser entry (`src/index.js`) under Node.
+        Framework::Webpack
+            if !has_server_script
+                && is_webpack_spa(package)
+                && !has_server_entry(ctx, package)? =>
+        {
+            match webpack_output_directory(ctx.app, package)? {
+                Some(directory) => Some(StaticSite {
+                    directory,
+                    spa: true,
+                }),
+                None => return Err(autopack_core::Error::MissingStartCommand),
+            }
+        }
         _ => None,
+    };
+    Ok(site)
+}
+
+/// Whether a webpack app bundles a browser page rather than a server.
+///
+/// webpack builds servers and libraries as readily as SPAs, so its presence
+/// says nothing about the output. `html-webpack-plugin` does: it is what
+/// emits the `index.html` a static server needs. The build script has to run
+/// webpack too, or the configured output is never produced.
+fn is_webpack_spa(package: &PackageJson) -> bool {
+    package.has_dependency("html-webpack-plugin")
+        && package
+            .script("build")
+            .is_some_and(|script| !webpack_invocations(script).is_empty())
+}
+
+/// Root-level files that start a Node server. `src/index.js` is left out on
+/// purpose: it is webpack's default *browser* entry.
+const SERVER_ENTRY_POINTS: &[&str] =
+    &["server.js", "server.mjs", "index.js", "index.mjs", "app.js"];
+
+/// Whether something besides the bundle says the app runs a server: a start
+/// command the user supplied, a Procfile `web:` line, a `main` outside `src/`,
+/// or a root-level server entry point. An Express app that also builds its
+/// client with webpack is a server, as it was before webpack was recognised.
+fn has_server_entry(ctx: &BuildContext<'_>, package: &PackageJson) -> Result<bool> {
+    let user_start_command = ctx.env.config("START_CMD").is_some()
+        || ctx
+            .config
+            .deploy
+            .as_ref()
+            .is_some_and(|deploy| deploy.start_command.is_some());
+    let server_main = package.main.as_deref().is_some_and(|main| {
+        !main.trim_start_matches("./").starts_with("src/") && ctx.app.has_file(main)
+    });
+    Ok(user_start_command
+        || server_main
+        || procfile_web_command(ctx.app)?.is_some()
+        || SERVER_ENTRY_POINTS
+            .iter()
+            .any(|entry| ctx.app.has_file(entry)))
+}
+
+/// Config files webpack-cli loads when no `--config` is given, in its order.
+const WEBPACK_CONFIGS: &[&str] = &[
+    "webpack.config.js",
+    "webpack.config.mjs",
+    "webpack.config.cjs",
+    "webpack.config.ts",
+    "webpack.config.mts",
+    "webpack.config.cts",
+];
+
+/// Where a webpack build writes its output, relative to the app root.
+///
+/// `None` when it cannot be told without running the config: guessing would
+/// serve an empty directory, which is a worse failure than asking for
+/// `AUTOPACK_STATIC_DIR`. A config file is required: without one
+/// `html-webpack-plugin` never runs, so there would be no page to serve.
+fn webpack_output_directory(app: &App, package: &PackageJson) -> Result<Option<String>> {
+    let script = package.script("build").unwrap_or_default();
+    let flags = match webpack_invocations(script).as_slice() {
+        [invocation] => match WebpackFlags::parse(invocation) {
+            Some(flags) => flags,
+            None => return Ok(None),
+        },
+        // Several webpack runs may write several directories.
+        _ => return Ok(None),
+    };
+
+    let config_path = match flags.config {
+        Some(config) => config,
+        None => match WEBPACK_CONFIGS.iter().find(|name| app.has_file(name)) {
+            Some(name) => (*name).to_string(),
+            // webpack-cli also loads `webpack.config.babel.js`,
+            // `.webpack/webpackfile.js` and others; unknown here.
+            None => return Ok(None),
+        },
+    };
+    let Some(config) = app.read_file_opt(&config_path)? else {
+        return Ok(None);
+    };
+    if let Some(directory) = flags.output_path {
+        let webpack_4 = dependency_major(package, "webpack").is_some_and(|major| major <= 4);
+        // webpack-cli 3 reads `-o` as the output *file*.
+        if webpack_4 && flags.short_output {
+            return Ok(None);
+        }
+        return Ok(join_inside_app("", &directory));
     }
+    let config_dir = config_path
+        .trim_start_matches("./")
+        .rsplit_once('/')
+        .map_or("", |(directory, _)| directory);
+    Ok(configured_output_path(&config, config_dir))
+}
+
+/// webpack's `output.path` when the config does not set one.
+const WEBPACK_DEFAULT_OUTPUT: &str = "dist";
+
+/// The words of each command in `script` that runs webpack, from the word
+/// after `webpack` to the end of that command.
+fn webpack_invocations(script: &str) -> Vec<Vec<&str>> {
+    script
+        .split(['&', '|', ';'])
+        .filter_map(|command| {
+            let mut words = command.split_whitespace();
+            words.find(|word| matches!(*word, "webpack" | "webpack-cli"))?;
+            Some(words.collect())
+        })
+        .collect()
+}
+
+/// The webpack-cli flags that change which config is read or where it writes.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct WebpackFlags {
+    config: Option<String>,
+    output_path: Option<String>,
+    /// The output path came from `-o`, which webpack-cli 3 reads as a file.
+    short_output: bool,
+}
+
+impl WebpackFlags {
+    /// `None` when a relevant flag has a value that cannot be read: one
+    /// split by the shell's quoting, or the webpack-cli 3 `--output` file.
+    fn parse(words: &[&str]) -> Option<Self> {
+        let mut flags = Self::default();
+        let mut words = words.iter().copied();
+        while let Some(word) = words.next() {
+            let (name, inline) = match word.split_once('=') {
+                Some((name, value)) => (name, Some(value)),
+                None => (word, None),
+            };
+            let is_output = match name {
+                "--config" | "-c" => false,
+                "--output-path" | "-o" => true,
+                "--output" => return None,
+                _ => continue,
+            };
+            let value = unquote(inline.or_else(|| words.next())?)?;
+            if is_output {
+                flags.output_path = Some(value.to_string());
+                flags.short_output = name == "-o";
+            } else {
+                flags.config = Some(value.to_string());
+            }
+        }
+        Some(flags)
+    }
+}
+
+/// A shell word without its surrounding quotes, if it is complete.
+fn unquote(word: &str) -> Option<&str> {
+    for quote in ['\'', '"'] {
+        if let Some(rest) = word.strip_prefix(quote) {
+            return rest
+                .strip_suffix(quote)
+                .filter(|inner| !inner.contains(quote));
+        }
+    }
+    (!word.is_empty() && !word.contains(['\'', '"'])).then_some(word)
+}
+
+/// The major version of a declared dependency.
+fn dependency_major(package: &PackageJson, name: &str) -> Option<u64> {
+    package
+        .dependencies
+        .get(name)
+        .or_else(|| package.dev_dependencies.get(name))
+        .and_then(|range| {
+            crate::version::Version::parse(range.trim_start_matches(|c: char| !c.is_ascii_digit()))
+        })
+        .map(|version| version.major)
+}
+
+/// The directory a webpack config's `output.path` names, relative to the app.
+///
+/// Read as text rather than evaluated, like `next.config.*`. Recognises the
+/// forms configs are written in practice — `path.resolve(__dirname, 'build')`,
+/// `path.join(...)`, a bare `resolve(...)` — and a config with no
+/// `output.path`, which writes to `dist`. `__dirname` is the config's own
+/// directory (`config_dir`); `process.cwd()` is the app root. Several configs
+/// (an exported array) must agree.
+///
+/// Anything the parser does not fully account for is `None`: an `output` it
+/// could not read (shorthand, quoted key, `config.output`, a spread), or a
+/// config that pulls in another local file (`webpack-merge` over a common
+/// config) without naming `output.path` itself. `merge()` combines `output`
+/// deeply, so the common config's `path` survives an `output` block here
+/// that only sets `filename`.
+fn configured_output_path(config: &str, config_dir: &str) -> Option<String> {
+    let normalised = normalise_config(config);
+    let values = object_values(&normalised, "output");
+    if values.len() != mentions(&normalised, "output") {
+        return None;
+    }
+    let inherits_config = imports_local_config(&normalised);
+    if values.is_empty() && inherits_config {
+        return None;
+    }
+    let mut directories = Vec::new();
+    for value in values {
+        let ObjectValue::Literal(body) = value else {
+            // `output: sharedOutput` — defined elsewhere.
+            return None;
+        };
+        let directory = match top_level_value(body, "path") {
+            Some(path) => resolved_directory(path, config_dir)?,
+            None if inherits_config => return None,
+            None => WEBPACK_DEFAULT_OUTPUT.to_string(),
+        };
+        directories.push(directory);
+    }
+    match directories.split_first() {
+        None => Some(WEBPACK_DEFAULT_OUTPUT.to_string()),
+        Some((first, rest)) if rest.iter().all(|other| other == first) => Some(first.clone()),
+        Some(_) => None,
+    }
+}
+
+/// `config` with comments and whitespace removed outside string literals.
+///
+/// String contents are kept as written, so `'http://host'` keeps its `//`
+/// and a glob such as `'src/**/*.js'` its `/*`.
+fn normalise_config(config: &str) -> String {
+    let mut normalised = String::with_capacity(config.len());
+    let mut chars = config.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' | '"' | '`' => {
+                normalised.push(c);
+                while let Some(inner) = chars.next() {
+                    normalised.push(inner);
+                    if inner == '\\' {
+                        if let Some(escaped) = chars.next() {
+                            normalised.push(escaped);
+                        }
+                    } else if inner == c {
+                        break;
+                    }
+                }
+            }
+            '/' if chars.peek() == Some(&'/') => {
+                for skipped in chars.by_ref() {
+                    if skipped == '\n' {
+                        break;
+                    }
+                }
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                chars.next();
+                let mut previous = ' ';
+                for skipped in chars.by_ref() {
+                    if previous == '*' && skipped == '/' {
+                        break;
+                    }
+                    previous = skipped;
+                }
+            }
+            c if c.is_whitespace() => {}
+            c => normalised.push(c),
+        }
+    }
+    normalised
+}
+
+/// The characters of `source` that are outside string literals, with their
+/// byte offsets.
+fn structural_chars(source: &str) -> impl Iterator<Item = (usize, char)> + '_ {
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    source.char_indices().filter(move |&(_, c)| {
+        if let Some(open) = quote {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == open {
+                quote = None;
+            }
+            return false;
+        }
+        if matches!(c, '\'' | '"' | '`') {
+            quote = Some(c);
+            return false;
+        }
+        true
+    })
+}
+
+/// Whether `c` can continue a JavaScript identifier.
+fn is_identifier_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || c == '$'
+}
+
+/// How many times `word` appears as a whole word, strings included, so that
+/// a quoted `"output":` key or `config.output` is counted.
+fn mentions(source: &str, word: &str) -> usize {
+    source
+        .match_indices(word)
+        .filter(|(start, _)| {
+            let before = source[..*start].chars().next_back();
+            let after = source[start + word.len()..].chars().next();
+            !before.is_some_and(is_identifier_char) && !after.is_some_and(is_identifier_char)
+        })
+        .count()
+}
+
+/// Whether a config pulls in another local file or merges configs.
+fn imports_local_config(normalised: &str) -> bool {
+    normalised.contains("merge(")
+        || ["require(", "from", "import("].iter().any(|keyword| {
+            ["'.", "\"."]
+                .iter()
+                .any(|quote| normalised.contains(&format!("{keyword}{quote}")))
+        })
+}
+
+/// The value of a `key:` property, wherever it appears in `source`.
+enum ObjectValue<'a> {
+    /// An object literal; the text between its braces.
+    Literal(&'a str),
+    /// Anything that is not an object literal.
+    Expression,
+}
+
+/// Every value assigned to property `key` in normalised `source`.
+fn object_values<'a>(source: &'a str, key: &str) -> Vec<ObjectValue<'a>> {
+    let pattern = format!("{key}:");
+    let mut values = Vec::new();
+    for (start, _) in source.match_indices(&pattern) {
+        // A property name, not the tail of a longer one (`libraryOutput:`).
+        let preceded_by_boundary = source[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| matches!(c, '{' | ','));
+        if !preceded_by_boundary {
+            continue;
+        }
+        let rest = &source[start + pattern.len()..];
+        values.push(match rest.strip_prefix('{').and_then(balanced_body) {
+            Some(body) => ObjectValue::Literal(body),
+            None => ObjectValue::Expression,
+        });
+    }
+    values
+}
+
+/// The text up to the brace that closes one already opened.
+fn balanced_body(source: &str) -> Option<&str> {
+    let mut depth = 0usize;
+    for (index, c) in structural_chars(source) {
+        match c {
+            '{' | '(' | '[' => depth += 1,
+            '}' | ')' | ']' if depth == 0 => return (c == '}').then(|| &source[..index]),
+            '}' | ')' | ']' => depth -= 1,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The value of `key:` among the top-level properties of an object body.
+fn top_level_value<'a>(body: &'a str, key: &str) -> Option<&'a str> {
+    let mut depth = 0usize;
+    let mut property_start = 0;
+    let mut properties = Vec::new();
+    for (index, c) in structural_chars(body) {
+        match c {
+            '{' | '(' | '[' => depth += 1,
+            '}' | ')' | ']' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                properties.push(&body[property_start..index]);
+                property_start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    properties.push(&body[property_start..]);
+    properties
+        .into_iter()
+        .find_map(|property| property.strip_prefix(key)?.strip_prefix(':'))
+}
+
+/// How a config reaches Node's `path` module before calling `resolve`/`join`.
+const PATH_MODULE_PREFIXES: &[&str] = &[
+    "path.",
+    "require('path').",
+    "require(\"path\").",
+    "require('node:path').",
+    "require(\"node:path\").",
+];
+
+/// The app-relative directory a `path.resolve(__dirname, ...)` call names.
+fn resolved_directory(value: &str, config_dir: &str) -> Option<String> {
+    let call = PATH_MODULE_PREFIXES
+        .iter()
+        .find_map(|prefix| value.strip_prefix(prefix))
+        .unwrap_or(value);
+    let arguments = call
+        .strip_prefix("resolve(")
+        .or_else(|| call.strip_prefix("join("))?
+        .strip_suffix(')')?;
+    let mut arguments = arguments.split(',');
+    let base = match arguments.next()? {
+        "__dirname" | "import.meta.dirname" => config_dir,
+        "process.cwd()" => "",
+        _ => return None,
+    };
+    let segments: Option<Vec<&str>> = arguments.map(string_literal).collect();
+    join_inside_app(base, &segments?.join("/"))
+}
+
+/// The contents of a quoted string with nothing interpolated into it.
+fn string_literal(value: &str) -> Option<&str> {
+    let quote = value.chars().next()?;
+    if !matches!(quote, '\'' | '"' | '`') {
+        return None;
+    }
+    let inner = value.strip_prefix(quote)?.strip_suffix(quote)?;
+    (!inner.contains(quote) && !inner.contains("${") && !inner.contains('\\')).then_some(inner)
+}
+
+/// `relative` resolved against the app-relative `base`, or `None` if it is
+/// absolute, leaves the app, is the app root itself, or names a directory a
+/// Caddyfile cannot hold unquoted.
+fn join_inside_app(base: &str, relative: &str) -> Option<String> {
+    if relative.starts_with('/') {
+        return None;
+    }
+    let mut segments: Vec<&str> = Vec::new();
+    for segment in base.split('/').chain(relative.split('/')) {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                segments.pop()?;
+            }
+            segment => segments.push(segment),
+        }
+    }
+    let safe = segments.iter().all(|segment| {
+        segment
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '@' | '+'))
+    });
+    (!segments.is_empty() && safe).then(|| segments.join("/"))
 }
 
 /// What a non-Node provider learns from [`plan_front_end`].
@@ -810,8 +1277,11 @@ fn is_simple_command(script: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{needs_legacy_openssl, PackageJson, PLAYWRIGHT_BROWSERS, RUNTIME_DEPS_FILE};
-    use crate::test_support::{plan_for, plan_with_env, write_app};
+    use super::{
+        configured_output_path, needs_legacy_openssl, PackageJson, WebpackFlags,
+        PLAYWRIGHT_BROWSERS, RUNTIME_DEPS_FILE,
+    };
+    use crate::test_support::{plan_for, plan_with_env, try_plan_for, write_app};
     use autopack_core::APP_DIR;
 
     #[test]
@@ -923,6 +1393,421 @@ mod tests {
         assert_eq!(
             analysis.plan.deploy.start_command.as_deref(),
             Some("npm run start")
+        );
+    }
+
+    /// A React app bundled by webpack 5 with `html-webpack-plugin`, the shape
+    /// of a Module Federation host or remote.
+    const WEBPACK_SPA_PACKAGE: &str = r#"{
+        "scripts": {"dev": "webpack serve --mode development", "build": "webpack --mode production"},
+        "dependencies": {"react": "^18.3.1", "react-dom": "^18.3.1"},
+        "devDependencies": {"html-webpack-plugin": "^5.6.0", "webpack": "^5.94.0", "webpack-cli": "^5.1.4"}
+    }"#;
+
+    /// A webpack 5 SPA whose build script is `build`.
+    fn webpack_package(build: &str) -> String {
+        format!(
+            r#"{{"scripts":{{"build":"{build}"}},
+                "devDependencies":{{"html-webpack-plugin":"5","webpack":"^5.94.0"}}}}"#
+        )
+    }
+
+    /// What a planned app serves, or `None` when planning fails.
+    fn serves(files: &[(&str, &str)]) -> Option<String> {
+        let (_dir, app) = write_app(files);
+        let analysis = try_plan_for(&app).ok()?;
+        analysis.metadata.get("serve").cloned()
+    }
+
+    /// A Module Federation-style config with no `output.path` writes `dist`.
+    #[test]
+    fn webpack_spas_are_served_as_static_sites_from_dist() {
+        let (_dir, app) = write_app(&[
+            ("package.json", WEBPACK_SPA_PACKAGE),
+            ("package-lock.json", "{}"),
+            (
+                "webpack.config.js",
+                r#"const HtmlWebpackPlugin = require('html-webpack-plugin');
+const { ModuleFederationPlugin } = require('webpack').container;
+module.exports = {
+  entry: './src/index', // bootstraps the remotes
+  output: { publicPath: 'auto', clean: true },
+  devServer: { port: 3000, historyApiFallback: true },
+  plugins: [
+    new ModuleFederationPlugin({ name: 'host', remotes: { shop: 'shop@http://localhost:3001/remoteEntry.js' } }),
+    new HtmlWebpackPlugin({ template: './src/index.html' }),
+  ],
+};"#,
+            ),
+            ("src/index.html", r#"<div id="root"></div>"#),
+            // webpack's default browser entry is not a server entry point.
+            ("src/index.js", "import('./bootstrap');"),
+        ]);
+        let analysis = plan_for(&app);
+
+        assert_eq!(analysis.metadata["framework"], "webpack");
+        assert_eq!(analysis.metadata["serve"], "caddy static (dist)");
+        assert!(analysis
+            .plan
+            .deploy
+            .start_command
+            .as_deref()
+            .unwrap()
+            .starts_with("caddy run"));
+        assert_eq!(
+            analysis.plan.step("build").unwrap().commands[0].display_name(),
+            "npm run build"
+        );
+    }
+
+    /// `output.path` set with `path.resolve(__dirname, ...)` is served.
+    #[test]
+    fn webpack_spas_serve_the_configured_output_path() {
+        assert_eq!(
+            serves(&[
+                ("package.json", WEBPACK_SPA_PACKAGE),
+                (
+                    "webpack.config.js",
+                    "const path = require('path');\nmodule.exports = {\n  output: {\n    filename: '[name].[contenthash].js',\n    path: path.resolve(__dirname, 'build'),\n  },\n};",
+                ),
+            ])
+            .as_deref(),
+            Some("caddy static (build)")
+        );
+    }
+
+    /// Planning stops rather than starting the browser entry under Node.
+    #[test]
+    fn a_webpack_spa_whose_output_cannot_be_read_fails_planning() {
+        for config in [
+            // No config: html-webpack-plugin never runs without one.
+            None,
+            Some("module.exports = { output: { path: outputDirectory() } };"),
+        ] {
+            let mut files = vec![
+                ("package.json", WEBPACK_SPA_PACKAGE),
+                // Must not be started under Node as a fallback entry point.
+                ("src/index.js", "document.body.textContent = 'hi';"),
+            ];
+            if let Some(config) = config {
+                files.push(("webpack.config.js", config));
+            }
+            let (_dir, app) = write_app(&files);
+            let error = try_plan_for(&app).unwrap_err();
+            assert!(
+                matches!(error, autopack_core::Error::MissingStartCommand),
+                "{config:?}: {error}"
+            );
+            assert!(error.to_string().contains("AUTOPACK_STATIC_DIR"), "{error}");
+
+            let analysis = plan_with_env(&app, &[("AUTOPACK_STATIC_DIR", "out")]).unwrap();
+            assert_eq!(analysis.metadata["serve"], "caddy static (out)");
+            // A start command the user supplies makes it a server instead.
+            let analysis = plan_with_env(&app, &[("AUTOPACK_START_CMD", "node api.js")]).unwrap();
+            assert_eq!(
+                analysis.plan.deploy.start_command.as_deref(),
+                Some("node api.js")
+            );
+        }
+    }
+
+    /// A server entry point wins over a webpack client bundle.
+    #[test]
+    fn a_server_that_builds_its_client_with_webpack_stays_a_server() {
+        let config = (
+            "webpack.config.js",
+            "module.exports = { output: { path: require('path').resolve(__dirname, 'public') } };",
+        );
+        let start = |files: &[(&str, &str)]| {
+            let (_dir, app) = write_app(files);
+            plan_for(&app).plan.deploy.start_command
+        };
+        let package = webpack_package("webpack");
+        assert_eq!(
+            start(&[("package.json", &package), config, ("server.js", "")]).as_deref(),
+            Some("node server.js")
+        );
+        assert_eq!(
+            start(&[
+                ("package.json", &package),
+                config,
+                ("Procfile", "web: node api.js"),
+            ])
+            .as_deref(),
+            Some("node api.js")
+        );
+        let with_main = r#"{"main":"lib/api.js","scripts":{"build":"webpack"},
+            "devDependencies":{"html-webpack-plugin":"5","webpack":"5"}}"#;
+        assert_eq!(
+            start(&[("package.json", with_main), config, ("lib/api.js", "")]).as_deref(),
+            Some("node lib/api.js")
+        );
+    }
+
+    /// Without `html-webpack-plugin` there is no page to serve.
+    #[test]
+    fn webpack_without_an_html_page_runs_a_server() {
+        // webpack bundling a Node server: no html-webpack-plugin, a start script.
+        let (_dir, app) = write_app(&[(
+            "package.json",
+            r#"{"scripts":{"build":"webpack","start":"node dist/main.js"},
+                "devDependencies":{"webpack":"5","webpack-cli":"5"}}"#,
+        )]);
+        let analysis = plan_for(&app);
+        assert_eq!(analysis.metadata["framework"], "webpack");
+        assert_eq!(
+            analysis.plan.deploy.start_command.as_deref(),
+            Some("node dist/main.js")
+        );
+    }
+
+    /// A start script says the author runs a server.
+    #[test]
+    fn webpack_spas_with_a_start_script_run_it() {
+        let (_dir, app) = write_app(&[(
+            "package.json",
+            r#"{"scripts":{"build":"webpack","start":"node server.js"},
+                "devDependencies":{"html-webpack-plugin":"5","webpack":"5"}}"#,
+        )]);
+        assert_eq!(
+            plan_for(&app).plan.deploy.start_command.as_deref(),
+            Some("node server.js")
+        );
+    }
+
+    /// `--output-path` and webpack 5's `-o` decide the directory.
+    #[test]
+    fn webpack_cli_output_flags_override_the_config() {
+        let config = ("webpack.config.js", "module.exports = {};");
+        assert_eq!(
+            serves(&[
+                (
+                    "package.json",
+                    &webpack_package("webpack --mode production --output-path public/bundle")
+                ),
+                config,
+            ])
+            .as_deref(),
+            Some("caddy static (public/bundle)")
+        );
+        assert_eq!(
+            serves(&[("package.json", &webpack_package("webpack -o out")), config]).as_deref(),
+            Some("caddy static (out)")
+        );
+        // webpack-cli 3 reads `-o` as the output file.
+        let webpack_4 = r#"{"scripts":{"build":"webpack -o dist/bundle.js"},
+            "devDependencies":{"html-webpack-plugin":"4","webpack":"^4.46.0"}}"#;
+        assert_eq!(serves(&[("package.json", webpack_4), config]), None);
+    }
+
+    /// Flags of other tools in the build script are not webpack's.
+    #[test]
+    fn only_the_webpack_command_s_own_flags_are_read() {
+        let files = |build: String| {
+            vec![
+                ("package.json".to_string(), build),
+                (
+                    "webpack.config.js".to_string(),
+                    "module.exports = { output: { path: require('path').resolve(__dirname, 'build') } };"
+                        .to_string(),
+                ),
+                (".eslintrc.json".to_string(), "{}".to_string()),
+            ]
+        };
+        for build in [
+            "eslint -c .eslintrc.json src && webpack",
+            "node gen.js -o src/generated && webpack",
+            "webpack && purgecss -c p.js -o build/css",
+        ] {
+            let files = files(webpack_package(build));
+            let files: Vec<(&str, &str)> = files
+                .iter()
+                .map(|(name, contents)| (name.as_str(), contents.as_str()))
+                .collect();
+            assert_eq!(
+                serves(&files).as_deref(),
+                Some("caddy static (build)"),
+                "{build}"
+            );
+        }
+        // Two webpack runs may write two directories.
+        let files = files(webpack_package(
+            "webpack --config a.js && webpack --config b.js",
+        ));
+        let files: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(name, contents)| (name.as_str(), contents.as_str()))
+            .collect();
+        assert_eq!(serves(&files), None);
+    }
+
+    /// `__dirname` is the config file's directory, not the app root.
+    #[test]
+    fn a_named_config_resolves_dirname_against_its_own_directory() {
+        let package = webpack_package("webpack --config config/webpack.prod.js");
+        let serve = |path: &str| {
+            let config = format!(
+                "const path = require('path');\nmodule.exports = {{ output: {{ path: {path} }} }};"
+            );
+            serves(&[
+                ("package.json", &package),
+                ("webpack.config.js", "module.exports = { output: { path: require('path').resolve(__dirname, 'dev') } };"),
+                ("config/webpack.prod.js", &config),
+            ])
+        };
+        assert_eq!(
+            serve("path.resolve(__dirname, '../release')").as_deref(),
+            Some("caddy static (release)")
+        );
+        assert_eq!(
+            serve("path.resolve(__dirname, 'dist')").as_deref(),
+            Some("caddy static (config/dist)")
+        );
+        assert_eq!(
+            serve("path.resolve(process.cwd(), 'dist')").as_deref(),
+            Some("caddy static (dist)")
+        );
+    }
+
+    /// The config forms the parser reads, with the directory each names.
+    #[test]
+    fn webpack_output_paths_are_read_from_common_config_forms() {
+        let read = |config: &str| configured_output_path(config, "");
+
+        assert_eq!(read("module.exports = {}").as_deref(), Some("dist"));
+        assert_eq!(
+            read("export default { output: { path: path.join(__dirname, 'www') } }").as_deref(),
+            Some("www")
+        );
+        assert_eq!(
+            read("module.exports = { output: { path: resolve(process.cwd(), \"out\", \"web\") } }")
+                .as_deref(),
+            Some("out/web")
+        );
+        assert_eq!(
+            read(
+                "export default { output: { path: path.resolve(import.meta.dirname, './dist/') } }"
+            )
+            .as_deref(),
+            Some("dist")
+        );
+        // Nested `path` keys belong to other options, not to output.path.
+        assert_eq!(
+            read("module.exports = { output: { library: { path: 'x' }, clean: true } }").as_deref(),
+            Some("dist")
+        );
+        // `libraryOutput:` is not `output:`.
+        assert_eq!(
+            read("module.exports = { experiments: { libraryOutput: { path: 'x' } } }").as_deref(),
+            Some("dist")
+        );
+        // Comments are not config, wherever they sit.
+        assert_eq!(
+            read("module.exports = {\n  // output: { path: path.resolve(__dirname, 'old') },\n  entry: './src',\n}")
+                .as_deref(),
+            Some("dist")
+        );
+        assert_eq!(
+            read("module.exports = {\n  mode: 'production', // prod\n  output: { path: path.resolve(__dirname, 'build') },\n}")
+                .as_deref(),
+            Some("build")
+        );
+        assert_eq!(
+            read("module.exports = { /* x */ output: { path: path.resolve(__dirname, 'build') } }")
+                .as_deref(),
+            Some("build")
+        );
+        // Braces and `//` inside strings are not structure or comments.
+        assert_eq!(
+            read("module.exports = { output: { publicPath: 'http://cdn/}{', path: path.resolve(__dirname, 'build') } }")
+                .as_deref(),
+            Some("build")
+        );
+        // Configs exported as an array must agree.
+        assert_eq!(
+            read("module.exports = [{ output: { path: path.resolve(__dirname, 'a') } }, { output: {} }]"),
+            None
+        );
+        assert_eq!(
+            read("module.exports = [{ output: { clean: true } }, { output: {} }]").as_deref(),
+            Some("dist")
+        );
+        // A local helper does not matter when output is spelled out here.
+        assert_eq!(
+            read("const paths = require('./paths');\nmodule.exports = { output: { path: path.resolve(__dirname, 'build') } }")
+                .as_deref(),
+            Some("build")
+        );
+    }
+
+    /// Forms whose directory cannot be told without running the config.
+    #[test]
+    fn webpack_output_paths_that_cannot_be_read_safely_are_rejected() {
+        for config in [
+            "module.exports = { output: sharedOutput }",
+            "module.exports = { entry, output }",
+            "module.exports = { \"output\": { \"path\": \"/srv\" } }",
+            "config.output.path = path.resolve(__dirname, 'build'); module.exports = config;",
+            "module.exports = { output: { ...base.output } }",
+            "const common = require('./webpack.common');\nmodule.exports = merge(common, { mode: 'production' });",
+            "import common from './webpack.common.js';\nexport default { ...common, mode: 'production' };",
+            "const common = require('./webpack.common');\nmodule.exports = merge(common, { mode: 'production', output: { filename: '[name].[contenthash].js' } });",
+            "module.exports = { output: { path: '/var/www' } }",
+            "module.exports = { output: { path: path.resolve(__dirname, '../shared') } }",
+            "module.exports = { output: { path: path.resolve('/srv', 'dist') } }",
+            "module.exports = { output: { path: path.resolve(__dirname, `${target}`) } }",
+            "module.exports = { output: { path: path.resolve(__dirname, outDir) } }",
+            "module.exports = { output: { path: path.resolve(__dirname, 'my site') } }",
+        ] {
+            assert_eq!(configured_output_path(config, ""), None, "{config}");
+        }
+    }
+
+    /// `--flag value` and `--flag=value`, and the unreadable cases.
+    #[test]
+    fn webpack_cli_flags_are_parsed_in_both_spellings() {
+        let parse = |words: &str| {
+            let words: Vec<&str> = words.split_whitespace().collect();
+            WebpackFlags::parse(&words)
+        };
+        assert_eq!(
+            parse("--config=config/prod.js -o build"),
+            Some(WebpackFlags {
+                config: Some("config/prod.js".into()),
+                output_path: Some("build".into()),
+                short_output: true,
+            })
+        );
+        assert_eq!(
+            parse("-c 'webpack.prod.js' --output-path=\"out\""),
+            Some(WebpackFlags {
+                config: Some("webpack.prod.js".into()),
+                output_path: Some("out".into()),
+                short_output: false,
+            })
+        );
+        assert_eq!(parse("--mode production"), Some(WebpackFlags::default()));
+        // A quoted value the shell split, an empty one, a dangling flag, and
+        // webpack-cli 3's output *file* are all unreadable.
+        assert_eq!(parse("--output-path='my dir'"), None);
+        assert_eq!(parse("-c="), None);
+        assert_eq!(parse("--config"), None);
+        assert_eq!(parse("--output dist/bundle.js"), None);
+    }
+
+    /// An ESM service whose only script is `dev` still gets a start command.
+    #[test]
+    fn an_esm_entry_point_under_src_is_started_directly() {
+        let (_dir, app) = write_app(&[
+            (
+                "package.json",
+                r#"{"type":"module","scripts":{"dev":"node --watch src/index.mjs"},"dependencies":{"express":"^4.19.2"}}"#,
+            ),
+            ("src/index.mjs", "import express from 'express';"),
+        ]);
+        assert_eq!(
+            plan_for(&app).plan.deploy.start_command.as_deref(),
+            Some("node src/index.mjs")
         );
     }
 
